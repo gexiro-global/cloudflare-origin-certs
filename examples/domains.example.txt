@@ -1,0 +1,4 @@
+# One domain per line. Blank lines and # comments are ignored.
+# Each entry requests a certificate covering both example.com and *.example.com.
+example.com
+example.org
