@@ -12,7 +12,7 @@
 # Usage:
 #   ols-ssl-wire.sh [--certs DIR] [--vhosts DIR] [--apply] [--restart]
 #
-# Exit: 0 ok | 1 something was skipped | 2 usage error
+# Exit: 0 ok | 1 something was skipped or the restart failed | 2 usage error
 set -uo pipefail
 
 CERT_DIR="${OLS_CERT_DIR:-/usr/local/lsws/conf/cert/origin-certs}"
@@ -36,7 +36,7 @@ done
 [ -d "$VHOST_DIR" ] || { echo "vhost directory not found: $VHOST_DIR" >&2; exit 2; }
 [ "$APPLY" = "1" ] || echo '(dry run - nothing will be written; pass --apply to make changes)'
 
-WIRED=0; SKIPPED=0
+WIRED=0; SKIPPED=0; FAILED=0
 
 for cert in "$CERT_DIR"/*.crt; do
   [ -f "$cert" ] || continue
@@ -59,34 +59,70 @@ for cert in "$CERT_DIR"/*.crt; do
     continue
   fi
 
-  cp -a "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
+  # mktemp rather than a timestamp: two runs inside the same second would otherwise
+  # collide and the second backup would overwrite the only pre-change copy.
+  backup=$(mktemp "${conf}.bak.XXXXXX") || { echo "FAIL $domain - cannot create backup"; FAILED=$((FAILED+1)); continue; }
+  cat "$conf" > "$backup"
 
   if grep -qE '^[[:space:]]*vhssl[[:space:]]*\{' "$conf"; then
     # Rewrite keyFile/certFile ONLY inside the vhssl block. A global substitution on
     # /keyFile.*/ also rewrites unrelated blocks in the same file, which is how a config
-    # edit for one feature quietly breaks another.
-    KEY="$key" CERT="$cert" CONF="$conf" python3 - <<'PY'
-import os, re
+    # edit for one feature quietly breaks another. If the block exists but is missing
+    # either directive, insert it before the block closes rather than silently doing
+    # nothing and still reporting success.
+    if ! KEY="$key" CERT="$cert" CONF="$conf" python3 - <<'PY'
+import os
+import re
+import sys
+
 path = os.environ['CONF']
 with open(path, encoding='utf-8') as fh:
     lines = fh.readlines()
+
 out, depth, inside = [], 0, False
+seen_key = seen_cert = False
+wrote_block = False
+
 for line in lines:
-    if re.match(r'^\s*vhssl\s*\{', line):
-        inside, depth = True, line.count('{') - line.count('}')
-        out.append(line); continue
+    if not inside and re.match(r'^\s*vhssl\s*\{', line):
+        inside = True
+        depth = line.count('{') - line.count('}')
+        seen_key = seen_cert = False
+        out.append(line)
+        continue
     if inside:
         if re.match(r'^\s*keyFile\b', line):
-            out.append('  keyFile                 %s\n' % os.environ['KEY']); continue
+            out.append('  keyFile                 %s\n' % os.environ['KEY'])
+            seen_key = True
+            continue
         if re.match(r'^\s*certFile\b', line):
-            out.append('  certFile                %s\n' % os.environ['CERT']); continue
+            out.append('  certFile                %s\n' % os.environ['CERT'])
+            seen_cert = True
+            continue
         depth += line.count('{') - line.count('}')
         if depth <= 0:
+            # closing the block - add whatever the block was missing
+            if not seen_key:
+                out.append('  keyFile                 %s\n' % os.environ['KEY'])
+            if not seen_cert:
+                out.append('  certFile                %s\n' % os.environ['CERT'])
             inside = False
+            wrote_block = True
     out.append(line)
+
+if not wrote_block:
+    # vhssl opened but never closed - refuse to guess at a malformed config
+    sys.exit(1)
+
 with open(path, 'w', encoding='utf-8') as fh:
     fh.writelines(out)
 PY
+    then
+      echo "FAIL $domain - vhssl block looks malformed, restoring backup"
+      cat "$backup" > "$conf"
+      FAILED=$((FAILED+1))
+      continue
+    fi
     echo "WIRED $domain (updated vhssl)"
   else
     cat >> "$conf" <<EOF
@@ -104,13 +140,17 @@ EOF
 done
 
 echo
-echo "wired=$WIRED skipped=$SKIPPED"
+echo "wired=$WIRED skipped=$SKIPPED failed=$FAILED"
 
+RESTART_FAILED=0
 if [ "$APPLY" = "1" ] && [ "$RESTART" = "1" ] && [ "$WIRED" -gt 0 ]; then
   echo 'restarting OpenLiteSpeed'
-  "$LSWSCTRL" restart || echo 'restart failed - check the config before retrying'
+  if ! "$LSWSCTRL" restart; then
+    echo 'RESTART FAILED - check the config before retrying' >&2
+    RESTART_FAILED=1
+  fi
 elif [ "$APPLY" = "1" ] && [ "$WIRED" -gt 0 ]; then
   echo "config updated. Reload when you are ready:  $LSWSCTRL restart"
 fi
 
-[ "$SKIPPED" -eq 0 ]
+[ "$SKIPPED" -eq 0 ] && [ "$FAILED" -eq 0 ] && [ "$RESTART_FAILED" -eq 0 ]

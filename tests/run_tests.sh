@@ -55,6 +55,36 @@ grep -A3 'vhssl {' "$T/vhosts/site-a.example/vhost.conf" | grep -q "$T/certs2/si
 grep -q '/should/not/be/touched' "$T/vhosts/site-a.example/vhost.conf" \
   && ok 'update pass still leaves other blocks alone' || no 'update pass still leaves other blocks alone'
 
+echo '== regressions =='
+# A vhssl block that exists but lacks keyFile/certFile must have them inserted, not be
+# silently reported as wired.
+mkdir -p "$T/certs3" "$T/vhosts3/site.example"
+touch "$T/certs3/site.example.crt" "$T/certs3/site.example.key"
+printf 'docRoot /x\n\nvhssl {\n  certChain 0\n}\n' > "$T/vhosts3/site.example/vhost.conf"
+"$ROOT/ols-ssl-wire.sh" --certs "$T/certs3" --vhosts "$T/vhosts3" --apply >/dev/null 2>&1
+if grep -q 'keyFile' "$T/vhosts3/site.example/vhost.conf" && grep -q 'certFile' "$T/vhosts3/site.example/vhost.conf"; then
+  ok 'inserts keyFile/certFile into a vhssl block that lacks them'
+else
+  no 'inserts keyFile/certFile into a vhssl block that lacks them'
+fi
+
+# A domain name is used to build a filesystem path, so anything that is not a plain
+# hostname must be refused before it can traverse out of the output directory.
+for bad in '../../etc/evil' 'has space' '-leading-dash' 'trailing.dot.'; do
+  if "$ROOT/cf-origin-issue.sh" --dry-run --out "$T/certs3" "$bad" >/dev/null 2>&1; then
+    no "refuses implausible domain '$bad'"
+  else
+    ok "refuses implausible domain '$bad'"
+  fi
+done
+"$ROOT/cf-origin-issue.sh" --dry-run --out "$T/certs3" 'good.example.com' >/dev/null 2>&1 \
+  && ok 'still accepts a normal hostname' || no 'still accepts a normal hostname'
+
+# The credential must not be visible in the process arguments.
+grep -q 'X-Auth-User-Service-Key: \${CF_ORIGIN_CA_KEY}' "$ROOT/cf-origin-issue.sh" \
+  && no 'keeps the credential out of the command line' \
+  || ok 'keeps the credential out of the command line'
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

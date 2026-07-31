@@ -17,8 +17,10 @@ synthetic tree built by `tests/run_tests.sh`.
 These scripts handle private key material. Specific properties you should verify for yourself before
 trusting them:
 
-- The Origin CA key is read from the environment only. It is never written to disk, never passed as
-  a command-line argument (where it would be visible in `ps`), and never logged.
+- The Origin CA key is read from the environment only. It is never passed as a command-line
+  argument - process arguments are readable by other local users through `/proc` - and never
+  logged. It reaches `curl` through a config file written with `umask 077` inside a `mktemp -d`
+  directory, which is deleted immediately after the request.
 - Keys and CSRs are generated in a `mktemp -d` directory under `umask 077` and removed afterwards.
 - Output files are created with mode 600 before content is written.
 - `.gitignore` excludes `*.key`, `*.crt`, `*.pem` and `domains.txt`, and CI fails on any long

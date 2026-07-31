@@ -41,6 +41,18 @@ while [ $# -gt 0 ]; do
 done
 
 [ "${#DOMAINS[@]}" -gt 0 ] || { echo 'no domains given (use --domains FILE or list them as arguments)' >&2; exit 2; }
+
+# Domain names end up in filesystem paths below. Anything that is not a plain hostname is
+# rejected here rather than sanitised, so a crafted entry like "../../etc/x" in a domain list
+# cannot escape the output directory.
+for d in "${DOMAINS[@]}"; do
+  case "$d" in
+    *[!a-zA-Z0-9.-]*|.*|-*|*.|*..*|'')
+      echo "refusing implausible domain name: '$d'" >&2; exit 2 ;;
+  esac
+  printf '%s' "$d" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$' \
+    || { echo "refusing implausible domain name: '$d'" >&2; exit 2; }
+done
 command -v openssl >/dev/null 2>&1 || { echo 'openssl is required' >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo 'python3 is required (JSON handling)' >&2; exit 2; }
 
@@ -88,10 +100,14 @@ print(json.dumps({
     "csr": csr,
 }))')
 
-  response=$(curl -sS --max-time 45 -X POST "$API" \
-    -H "X-Auth-User-Service-Key: ${CF_ORIGIN_CA_KEY}" \
+  # The credential goes into a mode-600 curl config file, never onto the command line:
+  # arguments are world-readable through /proc while the process runs.
+  cfg="$work/curl.cfg"
+  ( umask 077; printf 'header = "X-Auth-User-Service-Key: %s"\n' "$CF_ORIGIN_CA_KEY" > "$cfg" )
+  response=$(curl -sS --max-time 45 -X POST "$API" -K "$cfg" \
     -H 'Content-Type: application/json' \
     --data-binary "$payload" 2>&1)
+  rm -f "$cfg"
 
   echo '   [3/3] parsing response'
   cert=$(printf '%s' "$response" | python3 -c '
