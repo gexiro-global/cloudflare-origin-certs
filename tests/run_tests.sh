@@ -80,11 +80,45 @@ done
 "$ROOT/cf-origin-issue.sh" --dry-run --out "$T/certs3" 'good.example.com' >/dev/null 2>&1 \
   && ok 'still accepts a normal hostname' || no 'still accepts a normal hostname'
 
-# The credential must not be visible in the process arguments.
-grep -q 'X-Auth-User-Service-Key: \${CF_ORIGIN_CA_KEY}' "$ROOT/cf-origin-issue.sh" \
-  && no 'keeps the credential out of the command line' \
-  || ok 'keeps the credential out of the command line'
+# Assert the runtime property rather than a spelling in the source: run the script against a
+# stub curl that records its own argv, and check the secret is not in it. A source grep would
+# still pass if the credential were passed some other way.
+CSTUB=$(mktemp -d)
+SECRET='SENTINELsecretvalue123'
+cat > "$CSTUB/curl" <<'STUBEOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$ARGV_DUMP"
+cat > "$STDIN_DUMP"
+echo '{"success":true,"result":{"certificate":"-----BEGIN CERTIFICATE-----"}}'
+STUBEOF
+chmod +x "$CSTUB/curl"
+mkdir -p "$CSTUB/out"
+PATH="$CSTUB:$PATH" ARGV_DUMP="$CSTUB/argv" STDIN_DUMP="$CSTUB/stdin" \
+  CF_ORIGIN_CA_KEY="$SECRET" "$ROOT/cf-origin-issue.sh" --out "$CSTUB/out" stub.example >/dev/null 2>&1
+
+if [ -f "$CSTUB/argv" ]; then
+  if grep -q "$SECRET" "$CSTUB/argv"; then
+    no 'the credential never reaches curl argv'
+  else
+    ok 'the credential never reaches curl argv'
+  fi
+  if grep -q "$SECRET" "$CSTUB/stdin" 2>/dev/null; then
+    ok 'the credential is delivered on stdin instead'
+  else
+    no 'the credential is delivered on stdin instead'
+  fi
+else
+  no 'the credential never reaches curl argv (stub curl was not invoked)'
+fi
+
+if grep -rq "$SECRET" "$CSTUB/out" 2>/dev/null; then
+  no 'no credential is left behind on disk'
+else
+  ok 'no credential is left behind on disk'
+fi
+rm -rf "$CSTUB"
 
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
+

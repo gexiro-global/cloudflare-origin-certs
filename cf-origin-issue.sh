@@ -9,7 +9,7 @@
 #   cf-origin-issue.sh --domains domains.txt [--out DIR] [--days N] [--dry-run]
 #   cf-origin-issue.sh example.com another.example [--out DIR]
 #
-# Credentials (never passed on the command line, never written to disk by this script):
+# Credentials (never in the command line, never written to disk):
 #   CF_ORIGIN_CA_KEY   your Cloudflare Origin CA key
 #
 # Exit: 0 all issued | 1 one or more failed | 2 usage/credential error
@@ -21,6 +21,12 @@ VALIDITY_DAYS="${CF_ORIGIN_DAYS:-5475}"   # Cloudflare's own default: 15 years
 DRY=0
 DOMAINS=()
 API="https://api.cloudflare.com/client/v4/certificates"
+WORK=""
+
+# The work directory holds a freshly generated private key. Remove it on any exit path,
+# including Ctrl-C and SIGTERM - not only on the happy path.
+cleanup(){ [ -n "$WORK" ] && rm -rf "$WORK"; WORK=""; }
+trap cleanup EXIT INT TERM HUP
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -53,17 +59,30 @@ for d in "${DOMAINS[@]}"; do
   printf '%s' "$d" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$' \
     || { echo "refusing implausible domain name: '$d'" >&2; exit 2; }
 done
+
+case "$VALIDITY_DAYS" in
+  ''|*[!0-9]*) echo "--days must be a whole number of days, got '$VALIDITY_DAYS'" >&2; exit 2 ;;
+esac
+
 command -v openssl >/dev/null 2>&1 || { echo 'openssl is required' >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo 'python3 is required (JSON handling)' >&2; exit 2; }
 
-if [ "$DRY" = "0" ] && [ -z "${CF_ORIGIN_CA_KEY:-}" ]; then
-  echo 'CF_ORIGIN_CA_KEY is not set.' >&2
-  echo 'Get the Origin CA key from the Cloudflare dashboard and export it in your shell:' >&2
-  echo '  read -rs CF_ORIGIN_CA_KEY && export CF_ORIGIN_CA_KEY' >&2
-  exit 2
+if [ "$DRY" = "0" ]; then
+  if [ -z "${CF_ORIGIN_CA_KEY:-}" ]; then
+    echo 'CF_ORIGIN_CA_KEY is not set.' >&2
+    echo 'Get the Origin CA key from the Cloudflare dashboard and export it in your shell:' >&2
+    echo '  read -rs CF_ORIGIN_CA_KEY && export CF_ORIGIN_CA_KEY' >&2
+    exit 2
+  fi
+  # The key is interpolated into curl config syntax below. A quote, backslash or newline in it
+  # would let the value inject further curl directives, so refuse anything that is not a plain
+  # credential token.
+  case "$CF_ORIGIN_CA_KEY" in
+    *[!a-zA-Z0-9_.-]*) echo 'CF_ORIGIN_CA_KEY contains unexpected characters; refusing to use it' >&2; exit 2 ;;
+  esac
 fi
 
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" || { echo "cannot create output directory: $OUT_DIR" >&2; exit 2; }
 OK=0; BAD=0
 
 for domain in "${DOMAINS[@]}"; do
@@ -75,39 +94,50 @@ for domain in "${DOMAINS[@]}"; do
     OK=$((OK+1)); continue
   fi
 
-  work=$(mktemp -d) || { echo '   cannot create temp dir'; BAD=$((BAD+1)); continue; }
-  csr="$work/req.csr"; key="$work/req.key"
+  WORK=$(mktemp -d) || { echo '   FAILED: cannot create temp dir'; BAD=$((BAD+1)); continue; }
+  csr="$WORK/req.csr"; key="$WORK/req.key"
 
   echo '   [1/3] generating key and CSR'
   if ! openssl req -new -newkey rsa:2048 -nodes -out "$csr" -keyout "$key" \
         -subj "/CN=${domain}" 2>/dev/null; then
-    echo '   FAILED to generate CSR'; rm -rf "$work"; BAD=$((BAD+1)); continue
+    echo '   FAILED to generate CSR'; cleanup; BAD=$((BAD+1)); continue
   fi
 
   echo '   [2/3] requesting certificate from Cloudflare'
   # Build the request with a JSON encoder rather than string interpolation - a PEM body
   # inside a hand-built JSON string is one stray character away from a malformed request
   # that fails in a confusing way.
-  payload=$(CSR_PATH="$csr" DOMAIN="$domain" DAYS="$VALIDITY_DAYS" python3 -c '
-import json, os
-with open(os.environ["CSR_PATH"], encoding="utf-8") as fh:
-    csr = fh.read()
-domain = os.environ["DOMAIN"]
-print(json.dumps({
-    "hostnames": [f"*.{domain}", domain],
-    "requested_validity": int(os.environ["DAYS"]),
-    "request_type": "origin-rsa",
-    "csr": csr,
-}))')
+  if ! payload=$(CSR_PATH="$csr" DOMAIN="$domain" DAYS="$VALIDITY_DAYS" python3 -c '
+import json, os, sys
+try:
+    with open(os.environ["CSR_PATH"], encoding="utf-8") as fh:
+        csr = fh.read()
+    domain = os.environ["DOMAIN"]
+    print(json.dumps({
+        "hostnames": [f"*.{domain}", domain],
+        "requested_validity": int(os.environ["DAYS"]),
+        "request_type": "origin-rsa",
+        "csr": csr,
+    }))
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+'); then
+    echo '   FAILED: could not build the request payload'; cleanup; BAD=$((BAD+1)); continue
+  fi
 
-  # The credential goes into a mode-600 curl config file, never onto the command line:
-  # arguments are world-readable through /proc while the process runs.
-  cfg="$work/curl.cfg"
-  ( umask 077; printf 'header = "X-Auth-User-Service-Key: %s"\n' "$CF_ORIGIN_CA_KEY" > "$cfg" )
-  response=$(curl -sS --max-time 45 -X POST "$API" -K "$cfg" \
-    -H 'Content-Type: application/json' \
-    --data-binary "$payload" 2>&1)
-  rm -f "$cfg"
+  # The credential goes to curl on STDIN as a config stream: not in the command line, where
+  # /proc would expose it to other local users, and not in a file, where an abrupt exit would
+  # leave it on disk.
+  response=$(printf 'header = "X-Auth-User-Service-Key: %s"\n' "$CF_ORIGIN_CA_KEY" \
+    | curl -sS --max-time 45 -X POST "$API" -K - \
+        -H 'Content-Type: application/json' \
+        --data-binary "$payload" 2>&1)
+  curl_rc=$?
+  if [ "$curl_rc" -ne 0 ]; then
+    echo "   FAILED: curl exited $curl_rc (${response:-no output})"
+    cleanup; BAD=$((BAD+1)); continue
+  fi
 
   echo '   [3/3] parsing response'
   cert=$(printf '%s' "$response" | python3 -c '
@@ -124,17 +154,24 @@ print(data.get("result", {}).get("certificate", ""))
 ' 2>/dev/null)
 
   case "$cert" in
-    '')        echo '   FAILED: could not parse the Cloudflare response'; rm -rf "$work"; BAD=$((BAD+1)); continue ;;
-    ERROR:*)   echo "   FAILED: ${cert#ERROR:}"; rm -rf "$work"; BAD=$((BAD+1)); continue ;;
+    '')        echo '   FAILED: could not parse the Cloudflare response'; cleanup; BAD=$((BAD+1)); continue ;;
+    ERROR:*)   echo "   FAILED: ${cert#ERROR:}"; cleanup; BAD=$((BAD+1)); continue ;;
   esac
 
-  install -m 600 /dev/null "${OUT_DIR}/${domain}.crt"
-  install -m 600 /dev/null "${OUT_DIR}/${domain}.key"
-  printf '%s\n' "$cert" > "${OUT_DIR}/${domain}.crt"
-  cat "$key" > "${OUT_DIR}/${domain}.key"
-  rm -rf "$work"
+  # Every write is checked: reporting a certificate as issued when the file is missing or
+  # truncated is worse than reporting the failure.
+  crt_out="${OUT_DIR}/${domain}.crt"; key_out="${OUT_DIR}/${domain}.key"
+  if ! install -m 600 /dev/null "$crt_out" || ! install -m 600 /dev/null "$key_out"; then
+    echo '   FAILED: cannot create output files'; cleanup; BAD=$((BAD+1)); continue
+  fi
+  if ! printf '%s\n' "$cert" > "$crt_out" || ! cat "$key" > "$key_out"; then
+    echo '   FAILED: could not write the certificate or key'
+    rm -f "$crt_out" "$key_out"
+    cleanup; BAD=$((BAD+1)); continue
+  fi
+  cleanup
 
-  echo "   issued -> ${OUT_DIR}/${domain}.crt"
+  echo "   issued -> $crt_out"
   OK=$((OK+1))
   sleep 2   # be polite to the API
 done

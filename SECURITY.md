@@ -18,9 +18,15 @@ These scripts handle private key material. Specific properties you should verify
 trusting them:
 
 - The Origin CA key is read from the environment only. It is never passed as a command-line
-  argument - process arguments are readable by other local users through `/proc` - and never
-  logged. It reaches `curl` through a config file written with `umask 077` inside a `mktemp -d`
-  directory, which is deleted immediately after the request.
+  argument - process arguments are readable by other local users through `/proc` - never written
+  to disk, and never logged. It reaches `curl` as a config stream on **stdin** (`curl -K -`).
+- The key is interpolated into curl config syntax, so a value containing a quote, backslash or
+  newline could inject further curl directives. Keys that are not plain credential tokens are
+  rejected before use.
+- The work directory holds a freshly generated private key. It is removed by a trap on `EXIT`,
+  `INT`, `TERM` and `HUP`, so an interrupted run does not leave key material behind.
+- Every output write is checked. A certificate is only counted as issued once both files exist
+  and were written successfully.
 - Keys and CSRs are generated in a `mktemp -d` directory under `umask 077` and removed afterwards.
 - Output files are created with mode 600 before content is written.
 - `.gitignore` excludes `*.key`, `*.crt`, `*.pem` and `domains.txt`, and CI fails on any long
