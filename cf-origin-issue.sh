@@ -26,7 +26,13 @@ WORK=""
 # The work directory holds a freshly generated private key. Remove it on any exit path,
 # including Ctrl-C and SIGTERM - not only on the happy path.
 cleanup(){ [ -n "$WORK" ] && rm -rf "$WORK"; WORK=""; }
-trap cleanup EXIT INT TERM HUP
+# A signal handler that only cleans up and returns lets the loop carry on to the next domain,
+# so Ctrl-C would not actually stop issuance. Clean up, then exit with the conventional status.
+on_signal(){ sig="$1"; cleanup; echo "interrupted by SIG${sig}" >&2; trap - EXIT; exit $((128 + $2)); }
+trap cleanup EXIT
+trap 'on_signal INT 2'  INT
+trap 'on_signal TERM 15' TERM
+trap 'on_signal HUP 1'   HUP
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -158,15 +164,23 @@ print(data.get("result", {}).get("certificate", ""))
     ERROR:*)   echo "   FAILED: ${cert#ERROR:}"; cleanup; BAD=$((BAD+1)); continue ;;
   esac
 
-  # Every write is checked: reporting a certificate as issued when the file is missing or
-  # truncated is worse than reporting the failure.
+  # Write both files completely inside the work directory first, then move them into place.
+  # Truncating the destinations up front means a failure partway through destroys a previously
+  # valid certificate and leaves a mismatched pair behind.
   crt_out="${OUT_DIR}/${domain}.crt"; key_out="${OUT_DIR}/${domain}.key"
-  if ! install -m 600 /dev/null "$crt_out" || ! install -m 600 /dev/null "$key_out"; then
-    echo '   FAILED: cannot create output files'; cleanup; BAD=$((BAD+1)); continue
+  crt_tmp="$WORK/out.crt"; key_tmp="$WORK/out.key"
+  if ! (umask 077; printf '%s\n' "$cert" > "$crt_tmp") || ! (umask 077; cat "$key" > "$key_tmp"); then
+    echo '   FAILED: could not stage the certificate or key'; cleanup; BAD=$((BAD+1)); continue
   fi
-  if ! printf '%s\n' "$cert" > "$crt_out" || ! cat "$key" > "$key_out"; then
-    echo '   FAILED: could not write the certificate or key'
-    rm -f "$crt_out" "$key_out"
+  chmod 600 "$crt_tmp" "$key_tmp" 2>/dev/null
+  if ! mv -f "$crt_tmp" "$crt_out"; then
+    echo '   FAILED: could not install the certificate'; cleanup; BAD=$((BAD+1)); continue
+  fi
+  if ! mv -f "$key_tmp" "$key_out"; then
+    # The certificate landed but the key did not: remove the half-written pair rather than
+    # leaving a certificate whose key is missing or stale.
+    echo '   FAILED: could not install the key; removing the orphaned certificate'
+    rm -f "$crt_out"
     cleanup; BAD=$((BAD+1)); continue
   fi
   cleanup

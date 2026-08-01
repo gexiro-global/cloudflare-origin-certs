@@ -118,7 +118,89 @@ else
 fi
 rm -rf "$CSTUB"
 
+# A signal handler that cleans up but returns lets the loop continue to the next domain, so
+# Ctrl-C would not actually stop issuance. Deterministic check: a stub openssl terminates the
+# script while the SECOND domain is being processed, and the second certificate must not exist.
+SIG=$(mktemp -d)
+mkdir -p "$SIG/out"
+cat > "$SIG/openssl" <<'STUBEOF'
+#!/bin/bash
+COUNT_FILE="$STUB_DIR/count"
+n=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$COUNT_FILE"
+if [ "$n" -ge 2 ]; then
+  kill -TERM "$PPID" 2>/dev/null
+  sleep 5
+  exit 1
+fi
+# first domain: produce a usable key and CSR
+out=""; keyout=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -out) shift; out="$1" ;;
+    -keyout) shift; keyout="$1" ;;
+  esac
+  shift
+done
+[ -n "$out" ] && echo 'stub-csr' > "$out"
+[ -n "$keyout" ] && echo 'stub-key' > "$keyout"
+exit 0
+STUBEOF
+cat > "$SIG/curl" <<'STUBEOF'
+#!/bin/bash
+cat >/dev/null
+echo '{"success":true,"result":{"certificate":"stub-cert"}}'
+STUBEOF
+chmod +x "$SIG/openssl" "$SIG/curl"
+
+mkdir -p "$SIG/tmp"
+set +e
+PATH="$SIG:$PATH" STUB_DIR="$SIG" TMPDIR="$SIG/tmp" CF_ORIGIN_CA_KEY=stubkey \
+  "$ROOT/cf-origin-issue.sh" --out "$SIG/out" first.example second.example >/dev/null 2>&1
+SIGRC=$?
+set -e
+
+if [ -f "$SIG/out/second.example.crt" ]; then
+  no 'a termination signal stops issuance instead of continuing to the next domain'
+else
+  ok 'a termination signal stops issuance instead of continuing to the next domain'
+fi
+[ "$SIGRC" -ne 0 ] && ok 'an interrupted run exits non-zero' || no 'an interrupted run exits non-zero'
+# The work directory holds a private key; a signal must not leave it behind.
+if [ -n "$(ls -A "$SIG/tmp" 2>/dev/null)" ]; then
+  no 'no work directory is left behind after a signal'
+else
+  ok 'no work directory is left behind after a signal'
+fi
+rm -rf "$SIG"
+
+# If the key cannot be installed, the certificate must not be left behind on its own: a
+# certificate whose private key is missing or stale is worse than no certificate at all.
+ORPH=$(mktemp -d)
+mkdir -p "$ORPH/out"
+cat > "$ORPH/curl" <<'STUBEOF'
+#!/bin/bash
+cat >/dev/null
+echo '{"success":true,"result":{"certificate":"stub-cert"}}'
+STUBEOF
+chmod +x "$ORPH/curl"
+# Make the key install genuinely fail: mv refuses when dst/<basename of src> is a non-empty
+# directory. The staged key is named out.key, so block exactly that path.
+mkdir -p "$ORPH/out/orphan.example.key/out.key/blocker"
+set +e
+PATH="$ORPH:$PATH" CF_ORIGIN_CA_KEY=stubkey \
+  "$ROOT/cf-origin-issue.sh" --out "$ORPH/out" orphan.example >/dev/null 2>&1
+set -e
+if [ -f "$ORPH/out/orphan.example.crt" ]; then
+  no 'a certificate is not left behind when its key cannot be installed'
+else
+  ok 'a certificate is not left behind when its key cannot be installed'
+fi
+rm -rf "$ORPH"
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
+
 

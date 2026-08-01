@@ -110,9 +110,9 @@ Full (strict) for that zone.
 ./tests/run_tests.sh
 ```
 
-Thirteen assertions, fully offline: no Cloudflare API calls, no OpenLiteSpeed, no root. The wiring
-tests run against a synthetic vhost tree, including a regression test that a `keyFile` line outside
-the `vhssl` block is left alone.
+Fully offline: no Cloudflare API calls, no OpenLiteSpeed, no root. The wiring tests run against a
+synthetic vhost tree, and the credential test runs the issuer against a stub `curl` that records its
+own arguments, asserting the key never reaches argv and is never left on disk.
 
 ## License
 

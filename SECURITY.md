@@ -23,8 +23,9 @@ trusting them:
 - The key is interpolated into curl config syntax, so a value containing a quote, backslash or
   newline could inject further curl directives. Keys that are not plain credential tokens are
   rejected before use.
-- The work directory holds a freshly generated private key. It is removed by a trap on `EXIT`,
-  `INT`, `TERM` and `HUP`, so an interrupted run does not leave key material behind.
+- The work directory holds a freshly generated private key. A trap removes it on `EXIT`, and
+  `INT`, `TERM` and `HUP` clean up and then terminate the run rather than continuing to the
+  next domain, so an interrupted run neither leaves key material behind nor keeps issuing.
 - Every output write is checked. A certificate is only counted as issued once both files exist
   and were written successfully.
 - Keys and CSRs are generated in a `mktemp -d` directory under `umask 077` and removed afterwards.
