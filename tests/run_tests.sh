@@ -1,5 +1,11 @@
 #!/bin/bash
 # Offline test suite. No Cloudflare API calls, no OpenLiteSpeed, no root.
+# shellcheck disable=SC2015,SC2016,SC2181
+# SC2015: the `[ cond ] && ok "..." || no "..."` shape is intentional here - `ok` cannot fail,
+#         so this is a two-branch report, not a mis-written if-then-else.
+# SC2016: single quotes are deliberate where a literal `$` belongs to awk, python or a stub.
+# SC2181: these suites check `$?` immediately after the command under test, which is the
+#         thing being asserted.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")

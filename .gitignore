@@ -3,5 +3,6 @@ origin-certs/
 *.crt
 *.key
 *.pem
+*.bak
 *.bak.*
 *.local

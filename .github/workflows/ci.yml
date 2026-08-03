@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y shellcheck
-      - run: shellcheck --severity=warning cf-origin-issue.sh ols-ssl-wire.sh tests/run_tests.sh
+      - run: shellcheck cf-origin-issue.sh ols-ssl-wire.sh tests/run_tests.sh
   test:
     runs-on: ubuntu-latest
     steps:
