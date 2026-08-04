@@ -36,17 +36,35 @@ done
 [ -d "$VHOST_DIR" ] || { echo "vhost directory not found: $VHOST_DIR" >&2; exit 2; }
 [ "$APPLY" = "1" ] || echo '(dry run - nothing will be written; pass --apply to make changes)'
 
+# Two runs rewriting the same vhost tree would interleave their swaps and their backups.
+# Fail closed, consistently with the rest of the toolkit.
+if [ "$APPLY" = "1" ]; then
+  WIRE_LOCK="${OLS_WIRE_LOCK:-/tmp/ols-ssl-wire.lock}"
+  command -v flock >/dev/null 2>&1 \
+    || { echo "flock is required so two runs cannot rewrite the same vhosts" >&2; exit 2; }
+  { exec 7>"$WIRE_LOCK"; } 2>/dev/null \
+    || { echo "cannot open lock file $WIRE_LOCK" >&2; exit 2; }
+  flock -n 7 || { echo "another wiring run holds $WIRE_LOCK" >&2; exit 2; }
+fi
+
 WIRED=0; SKIPPED=0; FAILED=0
 # "<backup>:<live file>" pairs, so a failed configuration test can restore every file this run
 # touched - not just the last one.
 BACKUPS=""
 
 restore_all(){
-  local pair b c
+  local pair b c rc=0
   for pair in $BACKUPS; do
     b=${pair%%:*}; c=${pair#*:}
-    [ -f "$b" ] && cp -p "$b" "$c" 2>/dev/null
+    if [ -f "$b" ]; then
+      cp -p "$b" "$c" || {
+        echo "ROLLBACK FAILED for $c - the backup is still at $b" >&2
+        rc=1
+      }
+    fi
   done
+  [ "$rc" = 0 ] || echo 'one or more vhosts could not be rolled back - fix them before reloading' >&2
+  return $rc
 }
 
 for cert in "$CERT_DIR"/*.crt; do
@@ -73,7 +91,10 @@ for cert in "$CERT_DIR"/*.crt; do
   # mktemp rather than a timestamp: two runs inside the same second would otherwise
   # collide and the second backup would overwrite the only pre-change copy.
   backup=$(mktemp "${conf}.bak.XXXXXX") || { echo "FAIL $domain - cannot create backup"; FAILED=$((FAILED+1)); continue; }
-  cat "$conf" > "$backup"
+  # cp -p, not cat: a backup that loses the owner and mode is not a backup you can restore.
+  cp -p "$conf" "$backup" || {
+    echo "FAIL $domain - cannot copy the config aside"; FAILED=$((FAILED+1)); continue
+  }
   BACKUPS="$BACKUPS $backup:$conf"
 
   # Everything is built here first; $conf itself is untouched until the rename below.
@@ -135,8 +156,11 @@ with open(os.environ['OUT'], 'w', encoding='utf-8') as fh:
     fh.writelines(out)
 PY
     then
-      echo "FAIL $domain - vhssl block looks malformed, restoring backup"
-      cat "$backup" > "$conf"
+      # $conf has not been touched - everything was built in $staged - so there is nothing to
+      # restore. Writing the backup over the live file here would reintroduce exactly the
+      # interrupted-write risk the staging design removes.
+      echo "FAIL $domain - vhssl block looks malformed, leaving the original untouched"
+      rm -f "$staged"
       FAILED=$((FAILED+1))
       continue
     fi
@@ -144,6 +168,10 @@ PY
       echo "FAIL $domain - staged config is empty, leaving the original alone"
       rm -f "$staged"; FAILED=$((FAILED+1)); continue
     fi
+    # mktemp creates 0600 root-owned files; the replacement must keep the vhost's own
+    # ownership and mode or the server may stop being able to read its config.
+    chmod --reference="$conf" "$staged" 2>/dev/null || true
+    chown --reference="$conf" "$staged" 2>/dev/null || true
     if ! mv -f "$staged" "$conf"; then
       echo "FAIL $domain - could not install the new config; original untouched"
       rm -f "$staged"; FAILED=$((FAILED+1)); continue
@@ -160,6 +188,8 @@ vhssl {
   sslProtocol             24
 }
 EOF
+    chmod --reference="$conf" "$staged" 2>/dev/null || true
+    chown --reference="$conf" "$staged" 2>/dev/null || true
     if [ ! -s "$staged" ] || ! mv -f "$staged" "$conf"; then
       echo "FAIL $domain - could not install the new config; original untouched"
       rm -f "$staged"; FAILED=$((FAILED+1)); continue
@@ -179,8 +209,10 @@ CONFIG_BAD=0
 if [ "$APPLY" = "1" ] && [ "$WIRED" -gt 0 ]; then
   # A batch that partly failed must not be validated and restarted as if it were complete: the
   # server would come up on a half-applied set of changes. Roll the whole batch back instead.
-  if [ "$FAILED" -gt 0 ]; then
-    echo "$FAILED vhost(s) failed - rolling back every file this run changed, not restarting" >&2
+  if [ "$FAILED" -gt 0 ] || { [ "$SKIPPED" -gt 0 ] && [ "$RESTART" = "1" ]; }; then
+    # A skipped vhost is one this run did not finish. Reloading on a partially applied set is
+    # the same hazard as reloading on a failed one, so --restart requires a complete batch.
+    echo "batch incomplete (failed=$FAILED skipped=$SKIPPED) - rolling back, not restarting" >&2
     restore_all
     CONFIG_BAD=1
   else

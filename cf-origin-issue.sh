@@ -25,7 +25,19 @@ WORK=""
 
 # The work directory holds a freshly generated private key. Remove it on any exit path,
 # including Ctrl-C and SIGTERM - not only on the happy path.
-cleanup(){ [ -n "$WORK" ] && rm -rf "$WORK"; WORK=""; }
+# Set when a rollback failed: the work directory holds the only surviving copies of the
+# previous pair, so it must outlive the run rather than being cleaned up under the operator.
+KEEP_WORK=0
+cleanup(){
+  if [ "$KEEP_WORK" = 1 ] && [ -n "$WORK" ]; then
+    echo "   recovery copies kept in $WORK - restore them by hand before re-running" >&2
+    WORK=""
+    KEEP_WORK=0
+    return 0
+  fi
+  [ -n "$WORK" ] && rm -rf "$WORK"
+  WORK=""
+}
 # A signal handler that only cleans up and returns lets the loop carry on to the next domain,
 # so Ctrl-C would not actually stop issuance. Clean up, then exit with the conventional status.
 on_signal(){ sig="$1"; cleanup; echo "interrupted by SIG${sig}" >&2; trap - EXIT; exit $((128 + $2)); }
@@ -304,11 +316,13 @@ PY
 
   if ! mv -f "$crt_tmp" "$crt_out"; then
     echo '   FAILED: could not install the certificate; previous pair left untouched'
-    restore_pair; cleanup; BAD=$((BAD+1)); continue
+    restore_pair || KEEP_WORK=1
+    cleanup; BAD=$((BAD+1)); continue
   fi
   if ! mv -f "$key_tmp" "$key_out"; then
     echo '   FAILED: could not install the key; restoring the previous pair'
-    restore_pair; cleanup; BAD=$((BAD+1)); continue
+    restore_pair || KEEP_WORK=1
+    cleanup; BAD=$((BAD+1)); continue
   fi
 
   # Confirm what actually landed on disk still matches, rather than trusting the moves.
@@ -316,7 +330,8 @@ PY
   inst_key=$(openssl rsa -noout -modulus -in "$key_out" 2>/dev/null | openssl md5)
   if [ -z "$inst_crt" ] || [ "$inst_crt" != "$inst_key" ]; then
     echo '   FAILED: the installed pair does not match; restoring the previous one'
-    restore_pair; cleanup; BAD=$((BAD+1)); continue
+    restore_pair || KEEP_WORK=1
+    cleanup; BAD=$((BAD+1)); continue
   fi
   cleanup
 

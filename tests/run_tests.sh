@@ -1,11 +1,13 @@
 #!/bin/bash
 # Offline test suite. No Cloudflare API calls, no OpenLiteSpeed, no root.
-# shellcheck disable=SC2015,SC2016,SC2181
+# shellcheck disable=SC2015,SC2016,SC2181,SC2094
 # SC2015: the `[ cond ] && ok "..." || no "..."` shape is intentional here - `ok` cannot fail,
 #         so this is a two-branch report, not a mis-written if-then-else.
 # SC2016: single quotes are deliberate where a literal `$` belongs to awk, python or a stub.
 # SC2181: these suites check `$?` immediately after the command under test, which is the
 #         thing being asserted.
+# SC2094: the lock-contention test deliberately holds the same file the script under test
+#         then tries to lock - that collision is the property being verified.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
@@ -351,6 +353,38 @@ printf '%s' "$OUT" | grep -q 'test before you reload' \
   && ok 'without --restart a missing validator is a warning, not a failure' \
   || no 'without --restart a missing validator is a warning, not a failure'
 rm -rf "$NOV"
+
+# --- an incomplete batch must not be validated and reloaded --------------------------------
+# A skipped vhost is one this run did not finish; reloading on a partially applied set carries
+# the same hazard as reloading on a failed one.
+INC=$(mktemp -d); mkdir -p "$INC/certs" "$INC/vhosts/ok.example" "$INC/bin"
+touch "$INC/certs/ok.example.crt" "$INC/certs/ok.example.key"
+touch "$INC/certs/orphan.example.crt"          # no key -> SKIPPED
+printf 'docRoot /x\n' > "$INC/vhosts/ok.example/vhost.conf"
+cp "$INC/vhosts/ok.example/vhost.conf" "$INC/orig.conf"
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$INC/bin/openlitespeed"
+printf '%s\n' '#!/bin/bash' "echo R > $INC/restarted" > "$INC/bin/lswsctrl"
+chmod +x "$INC/bin/openlitespeed" "$INC/bin/lswsctrl"
+OUT=$(OLS_BIN="$INC/bin/openlitespeed" LSWSCTRL="$INC/bin/lswsctrl" OLS_WIRE_LOCK="$INC/lk" \
+      "$ROOT/ols-ssl-wire.sh" --certs "$INC/certs" --vhosts "$INC/vhosts" --apply --restart 2>&1)
+printf '%s' "$OUT" | grep -q 'batch incomplete' \
+  && ok 'a skipped vhost blocks --restart' || no 'a skipped vhost blocks --restart'
+diff -q "$INC/orig.conf" "$INC/vhosts/ok.example/vhost.conf" >/dev/null \
+  && ok 'and the batch is rolled back' || no 'and the batch is rolled back'
+[ -f "$INC/restarted" ] && no 'and nothing is restarted' || ok 'and nothing is restarted'
+rm -rf "$INC"
+
+# --- concurrent wiring runs are serialised -------------------------------------------------
+LK=$(mktemp -d); mkdir -p "$LK/certs" "$LK/vhosts"
+touch "$LK/lock"
+( flock -n 9 || exit 1
+  OLS_WIRE_LOCK="$LK/lock" "$ROOT/ols-ssl-wire.sh" \
+    --certs "$LK/certs" --vhosts "$LK/vhosts" --apply >/dev/null 2>&1
+  echo $? > "$LK/rc" ) 9>"$LK/lock"
+[ "$(cat "$LK/rc" 2>/dev/null)" = 2 ] \
+  && ok 'a second wiring run refuses while the first holds the lock' \
+  || no 'a second wiring run refuses while the first holds the lock'
+rm -rf "$LK"
 
 echo
 echo "passed=$PASS failed=$FAIL"
