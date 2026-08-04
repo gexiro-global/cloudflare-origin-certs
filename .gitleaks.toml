@@ -1,0 +1,20 @@
+# gitleaks configuration
+#
+# Default ruleset, plus one narrow allowlist entry.
+#
+# The test suite sets CF_ORIGIN_CA_KEY to a sentinel value and then asserts that the value never
+# appears in curl's arguments and never reaches disk. The fixture has to look like a credential
+# for the assertion to mean anything - a test that proves secrets do not leak, using a string that
+# is not secret-shaped, proves nothing.
+#
+# Only that exact string is exempt, not the file: a real credential committed here later must
+# still be caught.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "The credential-leak test's sentinel value"
+regexes = [
+  '''SENTINELsecret123''',
+]
