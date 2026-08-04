@@ -175,34 +175,80 @@ print(data.get("result", {}).get("certificate", ""))
     ERROR:*)   echo "   FAILED: ${cert#ERROR:}"; cleanup; BAD=$((BAD+1)); continue ;;
   esac
 
-  # Never install a certificate on the API's word alone. Verify it parses, belongs to the key
-  # we generated, covers the requested names, and is currently valid.
+  # Never install a certificate on the API's word alone. Verify it parses, belongs to the key we
+  # generated, covers exactly the requested names, and is inside its validity window right now.
   printf '%s\n' "$cert" > "$WORK/verify.crt"
 
-  if ! openssl x509 -noout -in "$WORK/verify.crt" 2>/dev/null; then
-    echo '   FAILED: the API response is not a parseable certificate'; cleanup; BAD=$((BAD+1)); continue
-  fi
+  if ! CERT_FILE="$WORK/verify.crt" KEY_FILE="$key" DOMAIN="$domain" python3 - <<'PY'
+import datetime
+import os
+import subprocess
+import sys
 
-  cert_mod=$(openssl x509 -noout -modulus -in "$WORK/verify.crt" 2>/dev/null | openssl md5)
-  key_mod=$(openssl rsa -noout -modulus -in "$key" 2>/dev/null | openssl md5)
-  if [ -z "$cert_mod" ] || [ "$cert_mod" != "$key_mod" ]; then
-    echo '   FAILED: the returned certificate does not match the private key we generated'
+cert = os.environ['CERT_FILE']
+key = os.environ['KEY_FILE']
+domain = os.environ['DOMAIN'].lower()
+
+
+def openssl(*args):
+    return subprocess.run(['openssl', *args], capture_output=True, text=True)
+
+
+if openssl('x509', '-noout', '-in', cert).returncode != 0:
+    print('the response is not a parseable certificate', file=sys.stderr)
+    raise SystemExit(1)
+
+cert_mod = openssl('x509', '-noout', '-modulus', '-in', cert).stdout.strip()
+key_mod = openssl('rsa', '-noout', '-modulus', '-in', key).stdout.strip()
+if not cert_mod or cert_mod != key_mod:
+    print('the certificate does not match the private key this run generated', file=sys.stderr)
+    raise SystemExit(1)
+
+# Compare whole SAN entries. A substring test would accept DNS:example.com.evil for example.com,
+# because the requested name appears inside the longer one.
+san_text = openssl('x509', '-noout', '-ext', 'subjectAltName', '-in', cert).stdout
+names = set()
+for chunk in san_text.replace('\n', ',').split(','):
+    chunk = chunk.strip()
+    if chunk.lower().startswith('dns:'):
+        names.add(chunk[4:].strip().lower())
+
+wanted = {domain, '*.' + domain}
+missing = sorted(wanted - names)
+if missing:
+    print('certificate does not cover: ' + ', '.join(missing), file=sys.stderr)
+    print('  it covers: ' + (', '.join(sorted(names)) or '(no DNS names)'), file=sys.stderr)
+    raise SystemExit(1)
+
+
+def field(name):
+    out = openssl('x509', '-noout', name, '-in', cert).stdout.strip()
+    value = out.split('=', 1)[1].replace('GMT', '').strip()
+    # normalise the double space openssl uses for single-digit days
+    return datetime.datetime.strptime(' '.join(value.split()), '%b %d %H:%M:%S %Y').replace(
+        tzinfo=datetime.timezone.utc
+    )
+
+
+now = datetime.datetime.now(datetime.timezone.utc)
+not_before = field('-startdate')
+not_after = field('-enddate')
+
+# -checkend only answers "does it expire soon". A certificate whose validity has not started yet
+# would pass that and still be rejected by anything that checks the window.
+if now < not_before:
+    print('certificate is not valid yet (notBefore %s)' % not_before, file=sys.stderr)
+    raise SystemExit(1)
+if now >= not_after:
+    print('certificate has already expired (notAfter %s)' % not_after, file=sys.stderr)
+    raise SystemExit(1)
+PY
+  then
+    echo '   FAILED: the returned certificate did not pass verification'
     cleanup; BAD=$((BAD+1)); continue
   fi
 
-  san=$(openssl x509 -noout -ext subjectAltName -in "$WORK/verify.crt" 2>/dev/null)
-  if ! printf '%s' "$san" | grep -qF "DNS:$domain"; then
-    echo "   FAILED: the certificate does not cover $domain"; cleanup; BAD=$((BAD+1)); continue
-  fi
-  if ! printf '%s' "$san" | grep -qF "DNS:*.$domain"; then
-    echo "   FAILED: the certificate does not cover the *.$domain wildcard"; cleanup; BAD=$((BAD+1)); continue
-  fi
-
-  if ! openssl x509 -noout -checkend 0 -in "$WORK/verify.crt" >/dev/null 2>&1; then
-    echo '   FAILED: the returned certificate is already expired'; cleanup; BAD=$((BAD+1)); continue
-  fi
-
-  echo '   verified: parses, matches the key, covers both names, not expired'
+  echo '   verified: parses, matches the key, covers both names exactly, inside its validity window'
 
   # Installing a pair is transactional. The previous certificate and key are copied aside
   # first, because the old failure mode was: overwrite the certificate, fail to move the key,
@@ -212,12 +258,42 @@ print(data.get("result", {}).get("certificate", ""))
   crt_tmp="$WORK/out.crt";   key_tmp="$WORK/out.key"
   crt_prev="$WORK/prev.crt"; key_prev="$WORK/prev.key"
   had_prev_crt=0; had_prev_key=0
-  [ -f "$crt_out" ] && { cp -p "$crt_out" "$crt_prev" && had_prev_crt=1; }
-  [ -f "$key_out" ] && { cp -p "$key_out" "$key_prev" && had_prev_key=1; }
+  # Fail closed: if a previous file exists but cannot be copied aside, there is no rollback path,
+  # so nothing may be overwritten. Continuing here was the difference between a transaction and a
+  # best-effort attempt.
+  if [ -f "$crt_out" ]; then
+    if cp -p "$crt_out" "$crt_prev"; then
+      had_prev_crt=1
+    else
+      echo "   FAILED: cannot back up the existing certificate; refusing to overwrite it"
+      cleanup; BAD=$((BAD+1)); continue
+    fi
+  fi
+  if [ -f "$key_out" ]; then
+    if cp -p "$key_out" "$key_prev"; then
+      had_prev_key=1
+    else
+      echo "   FAILED: cannot back up the existing key; refusing to overwrite it"
+      cleanup; BAD=$((BAD+1)); continue
+    fi
+  fi
 
+  # Rollback reports its own failures rather than swallowing them: an operator whose restore
+  # silently failed is worse off than one who is told to look.
   restore_pair(){
-    if [ "$had_prev_crt" = 1 ]; then cp -p "$crt_prev" "$crt_out" 2>/dev/null; else rm -f "$crt_out"; fi
-    if [ "$had_prev_key" = 1 ]; then cp -p "$key_prev" "$key_out" 2>/dev/null; else rm -f "$key_out"; fi
+    local rc=0
+    if [ "$had_prev_crt" = 1 ]; then
+      cp -p "$crt_prev" "$crt_out" || { echo "   ROLLBACK FAILED for $crt_out" >&2; rc=1; }
+    else
+      rm -f "$crt_out" || { echo "   ROLLBACK FAILED removing $crt_out" >&2; rc=1; }
+    fi
+    if [ "$had_prev_key" = 1 ]; then
+      cp -p "$key_prev" "$key_out" || { echo "   ROLLBACK FAILED for $key_out" >&2; rc=1; }
+    else
+      rm -f "$key_out" || { echo "   ROLLBACK FAILED removing $key_out" >&2; rc=1; }
+    fi
+    [ "$rc" = 0 ] || echo "   the previous pair may be inconsistent - check $crt_out and $key_out" >&2
+    return $rc
   }
 
   if ! (umask 077; printf '%s\n' "$cert" > "$crt_tmp") \

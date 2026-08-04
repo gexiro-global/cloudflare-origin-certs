@@ -240,7 +240,7 @@ grep -q SENTINELsecret123 "$CA/ca/stdin.seen" 2>/dev/null \
 rm -rf "$CA"
 
 # --- what the API returns is not trusted on its word ----------------------------------------
-for mode in garbage mismatched-key missing-wildcard expired; do
+for mode in garbage mismatched-key missing-wildcard expired san-superstring not-yet-valid; do
   ca_run "$mode"
   # find, not ls|grep: filenames here are ours, but the shellcheck rule is right in general
   left=$(find "$CA/out" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l)
@@ -256,6 +256,8 @@ done
 ROLL=$(mktemp -d); mkdir -p "$ROLL/out" "$ROLL/tmp" "$ROLL/ca" "$ROLL/bin"
 cp "$HERE/fake-origin-ca.sh" "$ROLL/bin/curl"
 printf 'PREVIOUS-CERT\n' > "$ROLL/out/a.example.crt"
+# The key destination is a non-empty directory, which mv refuses to overwrite - so the key install
+# fails after the certificate has already been replaced.
 mkdir -p "$ROLL/out/a.example.key/out.key/blocker"
 env PATH="$ROLL/bin:$PATH" TMPDIR="$ROLL/tmp" FAKE_CA_DIR="$ROLL/ca" FAKE_CA_MODE=good \
     CF_ORIGIN_CA_KEY=SENTINELsecret123 \
@@ -264,6 +266,23 @@ grep -q 'PREVIOUS-CERT' "$ROLL/out/a.example.crt" 2>/dev/null \
   && ok 'a failed key install restores the previous certificate' \
   || no 'a failed key install restores the previous certificate'
 rm -rf "$ROLL"
+
+# Both halves must come back, not just the certificate. Make the backup itself impossible by
+# turning the existing key into an unreadable-by-copy directory, and assert nothing is touched.
+PAIR=$(mktemp -d); mkdir -p "$PAIR/out" "$PAIR/tmp" "$PAIR/ca" "$PAIR/bin"
+cp "$HERE/fake-origin-ca.sh" "$PAIR/bin/curl"
+printf 'PREVIOUS-CERT\n' > "$PAIR/out/a.example.crt"
+mkdir -p "$PAIR/out/a.example.key"          # a directory where a key file is expected
+env PATH="$PAIR/bin:$PATH" TMPDIR="$PAIR/tmp" FAKE_CA_DIR="$PAIR/ca" FAKE_CA_MODE=good \
+    CF_ORIGIN_CA_KEY=SENTINELsecret123 \
+    "$ROOT/cf-origin-issue.sh" --out "$PAIR/out" a.example >/dev/null 2>&1
+PAIR_RC=$?
+if [ "$PAIR_RC" -ne 0 ] && grep -q 'PREVIOUS-CERT' "$PAIR/out/a.example.crt" 2>/dev/null; then
+  ok 'an un-installable key leaves the previous certificate intact'
+else
+  no "an un-installable key leaves the previous certificate intact (rc=$PAIR_RC)"
+fi
+rm -rf "$PAIR"
 
 # --- the config must never be replaced without being validated first -----------------------
 # A vhost edit that breaks parsing takes every site down the moment the server reloads, so the
@@ -304,6 +323,34 @@ grep -q 'mv -f "$staged" "$conf"' "$ROOT/ols-ssl-wire.sh" \
   && ok 'the new config is staged and swapped in atomically' \
   || no 'the new config is staged and swapped in atomically'
 rm -rf "$OLS"
+
+# Restarting a configuration nobody could validate is exactly the outcome the config test exists
+# to prevent, so a missing test binary must block --restart rather than be noted and ignored.
+NOV=$(mktemp -d); mkdir -p "$NOV/certs" "$NOV/vhosts/s.example" "$NOV/bin"
+touch "$NOV/certs/s.example.crt" "$NOV/certs/s.example.key"
+printf 'docRoot /x\n' > "$NOV/vhosts/s.example/vhost.conf"
+cp "$NOV/vhosts/s.example/vhost.conf" "$NOV/orig.conf"
+printf '%s\n' '#!/bin/bash' "echo R > $NOV/restarted" > "$NOV/bin/lswsctrl"
+chmod +x "$NOV/bin/lswsctrl"
+
+OLS_BIN="$NOV/bin/absent" LSWSCTRL="$NOV/bin/lswsctrl" "$ROOT/ols-ssl-wire.sh" \
+  --certs "$NOV/certs" --vhosts "$NOV/vhosts" --apply --restart >/dev/null 2>&1
+NOV_RC=$?
+[ "$NOV_RC" -ne 0 ] && ok 'a missing config-test binary blocks --restart' \
+                    || no 'a missing config-test binary blocks --restart'
+diff -q "$NOV/orig.conf" "$NOV/vhosts/s.example/vhost.conf" >/dev/null \
+  && ok 'and rolls the vhost back' || no 'and rolls the vhost back'
+[ -f "$NOV/restarted" ] && no 'and does not restart' || ok 'and does not restart'
+
+# Without --restart the same situation is only a warning: nothing is reloaded, so unvalidated
+# changes on disk are the operator's call.
+cp "$NOV/orig.conf" "$NOV/vhosts/s.example/vhost.conf"
+OUT=$(OLS_BIN="$NOV/bin/absent" "$ROOT/ols-ssl-wire.sh" \
+      --certs "$NOV/certs" --vhosts "$NOV/vhosts" --apply 2>&1)
+printf '%s' "$OUT" | grep -q 'test before you reload' \
+  && ok 'without --restart a missing validator is a warning, not a failure' \
+  || no 'without --restart a missing validator is a warning, not a failure'
+rm -rf "$NOV"
 
 echo
 echo "passed=$PASS failed=$FAIL"

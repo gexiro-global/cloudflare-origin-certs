@@ -177,18 +177,34 @@ echo "wired=$WIRED skipped=$SKIPPED failed=$FAILED"
 # rolls every file this run touched back to its backup.
 CONFIG_BAD=0
 if [ "$APPLY" = "1" ] && [ "$WIRED" -gt 0 ]; then
-  OLS_BIN="${OLS_BIN:-/usr/local/lsws/bin/openlitespeed}"
-  if [ -x "$OLS_BIN" ]; then
-    if "$OLS_BIN" -t >/dev/null 2>&1; then
-      echo 'config test: OK'
-    else
-      echo 'CONFIG TEST FAILED - restoring every file this run changed, not restarting' >&2
-      "$OLS_BIN" -t 2>&1 | tail -5 >&2
+  # A batch that partly failed must not be validated and restarted as if it were complete: the
+  # server would come up on a half-applied set of changes. Roll the whole batch back instead.
+  if [ "$FAILED" -gt 0 ]; then
+    echo "$FAILED vhost(s) failed - rolling back every file this run changed, not restarting" >&2
+    restore_all
+    CONFIG_BAD=1
+  else
+    OLS_BIN="${OLS_BIN:-/usr/local/lsws/bin/openlitespeed}"
+    if [ -x "$OLS_BIN" ]; then
+      if "$OLS_BIN" -t >/dev/null 2>&1; then
+        echo 'config test: OK'
+      else
+        echo 'CONFIG TEST FAILED - restoring every file this run changed, not restarting' >&2
+        "$OLS_BIN" -t 2>&1 | tail -5 >&2
+        restore_all
+        CONFIG_BAD=1
+      fi
+    elif [ "$RESTART" = "1" ]; then
+      # Restarting a configuration nobody could validate is the failure this whole section exists
+      # to prevent, so a missing test binary is fatal here rather than a note.
+      echo "CANNOT VALIDATE: $OLS_BIN not found or not executable, and --restart was requested" >&2
+      echo 'rolling back every file this run changed; re-run without --restart to keep them' >&2
       restore_all
       CONFIG_BAD=1
+    else
+      echo "config test skipped: $OLS_BIN not found or not executable" >&2
+      echo 'the changes are in place but unvalidated - test before you reload' >&2
     fi
-  else
-    echo "config test skipped: $OLS_BIN not found or not executable" >&2
   fi
 fi
 

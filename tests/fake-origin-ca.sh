@@ -44,6 +44,9 @@ domain=$(printf '%s' "$payload" \
 
 if [ "$MODE" = missing-wildcard ]; then
   printf 'subjectAltName=DNS:%s\n' "$domain" > "$DIR/san.cnf"
+elif [ "$MODE" = san-superstring ]; then
+  # Names that CONTAIN the requested one. A substring check accepts these.
+  printf 'subjectAltName=DNS:%s.evil,DNS:*.%s.evil\n' "$domain" "$domain" > "$DIR/san.cnf"
 else
   printf 'subjectAltName=DNS:%s,DNS:*.%s\n' "$domain" "$domain" > "$DIR/san.cnf"
 fi
@@ -59,9 +62,16 @@ fi
 
 days=30
 [ "$MODE" = expired ] && days=-1
+# A certificate whose validity has not started yet: -checkend alone would accept it.
+startdate_args=""
+if [ "$MODE" = not-yet-valid ]; then
+  future=$(date -u -d '+2 days' '+%Y%m%d%H%M%SZ' 2>/dev/null)
+  [ -n "$future" ] && startdate_args="-not_before $future"
+fi
 
+# shellcheck disable=SC2086  # startdate_args is either empty or two separate arguments
 openssl x509 -req -in "$csr_in" -CA "$DIR/ca.crt" -CAkey "$DIR/ca.key" -CAcreateserial \
-  -days "$days" -extfile "$DIR/san.cnf" -out "$DIR/issued.crt" 2>/dev/null \
+  -days "$days" $startdate_args -extfile "$DIR/san.cnf" -out "$DIR/issued.crt" 2>/dev/null \
   || { echo '{"success":false,"errors":[{"message":"signing failed"}]}'; exit 0; }
 
 python3 - "$DIR/issued.crt" <<'PY'
