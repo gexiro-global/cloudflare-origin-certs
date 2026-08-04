@@ -12,7 +12,7 @@
 # Usage:
 #   ols-ssl-wire.sh [--certs DIR] [--vhosts DIR] [--apply] [--restart]
 #
-# Exit: 0 ok | 1 something was skipped or the restart failed | 2 usage error
+# Exit: 0 ok | 1 something was skipped, the config test failed, or the restart failed | 2 usage error
 set -uo pipefail
 
 CERT_DIR="${OLS_CERT_DIR:-/usr/local/lsws/conf/cert/origin-certs}"
@@ -37,6 +37,17 @@ done
 [ "$APPLY" = "1" ] || echo '(dry run - nothing will be written; pass --apply to make changes)'
 
 WIRED=0; SKIPPED=0; FAILED=0
+# "<backup>:<live file>" pairs, so a failed configuration test can restore every file this run
+# touched - not just the last one.
+BACKUPS=""
+
+restore_all(){
+  local pair b c
+  for pair in $BACKUPS; do
+    b=${pair%%:*}; c=${pair#*:}
+    [ -f "$b" ] && cp -p "$b" "$c" 2>/dev/null
+  done
+}
 
 for cert in "$CERT_DIR"/*.crt; do
   [ -f "$cert" ] || continue
@@ -63,6 +74,10 @@ for cert in "$CERT_DIR"/*.crt; do
   # collide and the second backup would overwrite the only pre-change copy.
   backup=$(mktemp "${conf}.bak.XXXXXX") || { echo "FAIL $domain - cannot create backup"; FAILED=$((FAILED+1)); continue; }
   cat "$conf" > "$backup"
+  BACKUPS="$BACKUPS $backup:$conf"
+
+  # Everything is built here first; $conf itself is untouched until the rename below.
+  staged=$(mktemp "${conf}.new.XXXXXX") || { echo "FAIL $domain - cannot create staging file"; FAILED=$((FAILED+1)); continue; }
 
   if grep -qE '^[[:space:]]*vhssl[[:space:]]*\{' "$conf"; then
     # Rewrite keyFile/certFile ONLY inside the vhssl block. A global substitution on
@@ -70,7 +85,7 @@ for cert in "$CERT_DIR"/*.crt; do
     # edit for one feature quietly breaks another. If the block exists but is missing
     # either directive, insert it before the block closes rather than silently doing
     # nothing and still reporting success.
-    if ! KEY="$key" CERT="$cert" CONF="$conf" python3 - <<'PY'
+    if ! KEY="$key" CERT="$cert" CONF="$conf" OUT="$staged" python3 - <<'PY'
 import os
 import re
 import sys
@@ -114,7 +129,9 @@ if not wrote_block:
     # vhssl opened but never closed - refuse to guess at a malformed config
     sys.exit(1)
 
-with open(path, 'w', encoding='utf-8') as fh:
+# Write the result beside the original. The live vhost.conf is only replaced later, by an
+# atomic rename, so an interrupted run can never leave a half-written config in place.
+with open(os.environ['OUT'], 'w', encoding='utf-8') as fh:
     fh.writelines(out)
 PY
     then
@@ -123,9 +140,18 @@ PY
       FAILED=$((FAILED+1))
       continue
     fi
+    if [ ! -s "$staged" ]; then
+      echo "FAIL $domain - staged config is empty, leaving the original alone"
+      rm -f "$staged"; FAILED=$((FAILED+1)); continue
+    fi
+    if ! mv -f "$staged" "$conf"; then
+      echo "FAIL $domain - could not install the new config; original untouched"
+      rm -f "$staged"; FAILED=$((FAILED+1)); continue
+    fi
     echo "WIRED $domain (updated vhssl)"
   else
-    cat >> "$conf" <<EOF
+    cat "$conf" > "$staged"
+    cat >> "$staged" <<EOF
 
 vhssl {
   keyFile                 $key
@@ -134,6 +160,10 @@ vhssl {
   sslProtocol             24
 }
 EOF
+    if [ ! -s "$staged" ] || ! mv -f "$staged" "$conf"; then
+      echo "FAIL $domain - could not install the new config; original untouched"
+      rm -f "$staged"; FAILED=$((FAILED+1)); continue
+    fi
     echo "WIRED $domain (appended vhssl)"
   fi
   WIRED=$((WIRED+1))
@@ -142,7 +172,30 @@ done
 echo
 echo "wired=$WIRED skipped=$SKIPPED failed=$FAILED"
 
+# Validate the configuration before anything is restarted. A vhost edit that breaks parsing takes
+# every site on the box down the moment the server reloads, so the test runs first and a failure
+# rolls every file this run touched back to its backup.
+CONFIG_BAD=0
+if [ "$APPLY" = "1" ] && [ "$WIRED" -gt 0 ]; then
+  OLS_BIN="${OLS_BIN:-/usr/local/lsws/bin/openlitespeed}"
+  if [ -x "$OLS_BIN" ]; then
+    if "$OLS_BIN" -t >/dev/null 2>&1; then
+      echo 'config test: OK'
+    else
+      echo 'CONFIG TEST FAILED - restoring every file this run changed, not restarting' >&2
+      "$OLS_BIN" -t 2>&1 | tail -5 >&2
+      restore_all
+      CONFIG_BAD=1
+    fi
+  else
+    echo "config test skipped: $OLS_BIN not found or not executable" >&2
+  fi
+fi
+
 RESTART_FAILED=0
+if [ "$CONFIG_BAD" = "1" ]; then
+  RESTART=0
+fi
 if [ "$APPLY" = "1" ] && [ "$RESTART" = "1" ] && [ "$WIRED" -gt 0 ]; then
   echo 'restarting OpenLiteSpeed'
   if ! "$LSWSCTRL" restart; then
@@ -153,4 +206,4 @@ elif [ "$APPLY" = "1" ] && [ "$WIRED" -gt 0 ]; then
   echo "config updated. Reload when you are ready:  $LSWSCTRL restart"
 fi
 
-[ "$SKIPPED" -eq 0 ] && [ "$FAILED" -eq 0 ] && [ "$RESTART_FAILED" -eq 0 ]
+[ "$SKIPPED" -eq 0 ] && [ "$FAILED" -eq 0 ] && [ "$RESTART_FAILED" -eq 0 ] && [ "$CONFIG_BAD" -eq 0 ]

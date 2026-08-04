@@ -161,11 +161,9 @@ STUBEOF
 chmod +x "$SIG/openssl" "$SIG/curl"
 
 mkdir -p "$SIG/tmp"
-set +e
 PATH="$SIG:$PATH" STUB_DIR="$SIG" TMPDIR="$SIG/tmp" CF_ORIGIN_CA_KEY=stubkey \
   "$ROOT/cf-origin-issue.sh" --out "$SIG/out" first.example second.example >/dev/null 2>&1
 SIGRC=$?
-set -e
 
 if [ -f "$SIG/out/second.example.crt" ]; then
   no 'a termination signal stops issuance instead of continuing to the next domain'
@@ -194,16 +192,118 @@ chmod +x "$ORPH/curl"
 # Make the key install genuinely fail: mv refuses when dst/<basename of src> is a non-empty
 # directory. The staged key is named out.key, so block exactly that path.
 mkdir -p "$ORPH/out/orphan.example.key/out.key/blocker"
-set +e
 PATH="$ORPH:$PATH" CF_ORIGIN_CA_KEY=stubkey \
   "$ROOT/cf-origin-issue.sh" --out "$ORPH/out" orphan.example >/dev/null 2>&1
-set -e
 if [ -f "$ORPH/out/orphan.example.crt" ]; then
   no 'a certificate is not left behind when its key cannot be installed'
 else
   ok 'a certificate is not left behind when its key cannot be installed'
 fi
 rm -rf "$ORPH"
+
+# --- issuance against a CA stub that actually signs the CSR ---------------------------------
+# A canned certificate cannot match the key the script generates, so it is rejected before the
+# install path runs - which would leave every assertion below it passing vacuously. This stub
+# signs the real CSR, so the happy path is genuinely exercised.
+ca_run(){ # <mode>
+  CA=$(mktemp -d); mkdir -p "$CA/out" "$CA/tmp" "$CA/ca" "$CA/bin"
+  cp "$HERE/fake-origin-ca.sh" "$CA/bin/curl"
+  env PATH="$CA/bin:$PATH" TMPDIR="$CA/tmp" FAKE_CA_DIR="$CA/ca" FAKE_CA_MODE="$1" \
+      CF_ORIGIN_CA_KEY=SENTINELsecret123 \
+      "$ROOT/cf-origin-issue.sh" --out "$CA/out" a.example >/dev/null 2>&1
+  CA_RC=$?
+}
+
+ca_run good
+[ "$CA_RC" -eq 0 ] && ok 'issues a certificate that passes verification' \
+                   || no "issues a certificate that passes verification (rc=$CA_RC)"
+
+CRT_MOD=$(openssl x509 -noout -modulus -in "$CA/out/a.example.crt" 2>/dev/null | openssl md5)
+KEY_MOD=$(openssl rsa  -noout -modulus -in "$CA/out/a.example.key" 2>/dev/null | openssl md5)
+if [ -n "$CRT_MOD" ] && [ "$CRT_MOD" = "$KEY_MOD" ]; then
+  ok 'the installed certificate and key are a matching pair'
+else
+  no 'the installed certificate and key are a matching pair'
+fi
+
+openssl x509 -noout -ext subjectAltName -in "$CA/out/a.example.crt" 2>/dev/null \
+  | tr -d ' ' | grep -q 'DNS:a.example,DNS:\*.a.example' \
+  && ok 'the installed certificate covers the apex and the wildcard' \
+  || no 'the installed certificate covers the apex and the wildcard'
+
+grep -q SENTINELsecret123 "$CA/ca/argv.seen" 2>/dev/null \
+  && no 'the credential never reaches curl argv' \
+  || ok 'the credential never reaches curl argv'
+grep -q SENTINELsecret123 "$CA/ca/stdin.seen" 2>/dev/null \
+  && ok 'the credential is delivered on stdin' \
+  || no 'the credential is delivered on stdin'
+rm -rf "$CA"
+
+# --- what the API returns is not trusted on its word ----------------------------------------
+for mode in garbage mismatched-key missing-wildcard expired; do
+  ca_run "$mode"
+  # find, not ls|grep: filenames here are ours, but the shellcheck rule is right in general
+  left=$(find "$CA/out" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l)
+  if [ "$CA_RC" -ne 0 ] && [ "$left" -eq 0 ]; then
+    ok "rejects a $mode certificate and installs nothing"
+  else
+    no "rejects a $mode certificate and installs nothing (rc=$CA_RC, files=$left)"
+  fi
+  rm -rf "$CA"
+done
+
+# --- a partial install must restore the previous pair, not destroy it ------------------------
+ROLL=$(mktemp -d); mkdir -p "$ROLL/out" "$ROLL/tmp" "$ROLL/ca" "$ROLL/bin"
+cp "$HERE/fake-origin-ca.sh" "$ROLL/bin/curl"
+printf 'PREVIOUS-CERT\n' > "$ROLL/out/a.example.crt"
+mkdir -p "$ROLL/out/a.example.key/out.key/blocker"
+env PATH="$ROLL/bin:$PATH" TMPDIR="$ROLL/tmp" FAKE_CA_DIR="$ROLL/ca" FAKE_CA_MODE=good \
+    CF_ORIGIN_CA_KEY=SENTINELsecret123 \
+    "$ROOT/cf-origin-issue.sh" --out "$ROLL/out" a.example >/dev/null 2>&1
+grep -q 'PREVIOUS-CERT' "$ROLL/out/a.example.crt" 2>/dev/null \
+  && ok 'a failed key install restores the previous certificate' \
+  || no 'a failed key install restores the previous certificate'
+rm -rf "$ROLL"
+
+# --- the config must never be replaced without being validated first -----------------------
+# A vhost edit that breaks parsing takes every site down the moment the server reloads, so the
+# test runs before any restart and a failure must roll the file back.
+OLS=$(mktemp -d); mkdir -p "$OLS/certs" "$OLS/vhosts/s.example" "$OLS/bin"
+touch "$OLS/certs/s.example.crt" "$OLS/certs/s.example.key"
+printf 'docRoot /x\n' > "$OLS/vhosts/s.example/vhost.conf"
+cp "$OLS/vhosts/s.example/vhost.conf" "$OLS/orig.conf"
+
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$OLS/bin/openlitespeed"
+chmod +x "$OLS/bin/openlitespeed"
+OUT=$(OLS_BIN="$OLS/bin/openlitespeed" "$ROOT/ols-ssl-wire.sh" \
+      --certs "$OLS/certs" --vhosts "$OLS/vhosts" --apply 2>&1)
+printf '%s' "$OUT" | grep -q 'config test: OK' \
+  && ok 'runs the OpenLiteSpeed config test before restarting' \
+  || no 'runs the OpenLiteSpeed config test before restarting'
+[ "$(grep -c 'vhssl' "$OLS/vhosts/s.example/vhost.conf")" -eq 1 ] \
+  && ok 'a validated change is kept' || no 'a validated change is kept'
+
+# now the same edit, with a config test that rejects it
+cp "$OLS/orig.conf" "$OLS/vhosts/s.example/vhost.conf"
+printf '%s\n' '#!/bin/bash' 'echo "parse error line 7" >&2' 'exit 1' > "$OLS/bin/openlitespeed"
+printf '%s\n' '#!/bin/bash' "echo RESTARTED > $OLS/restarted" > "$OLS/bin/lswsctrl"
+chmod +x "$OLS/bin/openlitespeed" "$OLS/bin/lswsctrl"
+OLS_BIN="$OLS/bin/openlitespeed" LSWSCTRL="$OLS/bin/lswsctrl" "$ROOT/ols-ssl-wire.sh" \
+  --certs "$OLS/certs" --vhosts "$OLS/vhosts" --apply --restart >/dev/null 2>&1
+OLS_RC=$?
+[ "$OLS_RC" -ne 0 ] && ok 'a failed config test fails the run' \
+                    || no 'a failed config test fails the run'
+diff -q "$OLS/orig.conf" "$OLS/vhosts/s.example/vhost.conf" >/dev/null \
+  && ok 'a failed config test rolls the vhost back' \
+  || no 'a failed config test rolls the vhost back'
+[ -f "$OLS/restarted" ] && no 'a failed config test prevents the restart' \
+                        || ok 'a failed config test prevents the restart'
+
+# the live file must never be the thing being written to
+grep -q 'mv -f "$staged" "$conf"' "$ROOT/ols-ssl-wire.sh" \
+  && ok 'the new config is staged and swapped in atomically' \
+  || no 'the new config is staged and swapped in atomically'
+rm -rf "$OLS"
 
 echo
 echo "passed=$PASS failed=$FAIL"

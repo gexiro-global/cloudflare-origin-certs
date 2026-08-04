@@ -89,6 +89,17 @@ if [ "$DRY" = "0" ]; then
 fi
 
 mkdir -p "$OUT_DIR" || { echo "cannot create output directory: $OUT_DIR" >&2; exit 2; }
+
+# Two concurrent runs would interleave writes to the same certificate pair. Fail closed: if
+# the lock cannot be taken, stop rather than issue unserialised.
+if [ "$DRY" = "0" ]; then
+  ISSUE_LOCK="${CF_ORIGIN_LOCK:-$OUT_DIR/.issue.lock}"
+  command -v flock >/dev/null 2>&1 \
+    || { echo "flock is required so two runs cannot write the same pair" >&2; exit 2; }
+  { exec 7>"$ISSUE_LOCK"; } 2>/dev/null \
+    || { echo "cannot open lock file $ISSUE_LOCK" >&2; exit 2; }
+  flock -n 7 || { echo "another issuance run holds $ISSUE_LOCK" >&2; exit 2; }
+fi
 OK=0; BAD=0
 
 for domain in "${DOMAINS[@]}"; do
@@ -164,24 +175,72 @@ print(data.get("result", {}).get("certificate", ""))
     ERROR:*)   echo "   FAILED: ${cert#ERROR:}"; cleanup; BAD=$((BAD+1)); continue ;;
   esac
 
-  # Write both files completely inside the work directory first, then move them into place.
-  # Truncating the destinations up front means a failure partway through destroys a previously
-  # valid certificate and leaves a mismatched pair behind.
+  # Never install a certificate on the API's word alone. Verify it parses, belongs to the key
+  # we generated, covers the requested names, and is currently valid.
+  printf '%s\n' "$cert" > "$WORK/verify.crt"
+
+  if ! openssl x509 -noout -in "$WORK/verify.crt" 2>/dev/null; then
+    echo '   FAILED: the API response is not a parseable certificate'; cleanup; BAD=$((BAD+1)); continue
+  fi
+
+  cert_mod=$(openssl x509 -noout -modulus -in "$WORK/verify.crt" 2>/dev/null | openssl md5)
+  key_mod=$(openssl rsa -noout -modulus -in "$key" 2>/dev/null | openssl md5)
+  if [ -z "$cert_mod" ] || [ "$cert_mod" != "$key_mod" ]; then
+    echo '   FAILED: the returned certificate does not match the private key we generated'
+    cleanup; BAD=$((BAD+1)); continue
+  fi
+
+  san=$(openssl x509 -noout -ext subjectAltName -in "$WORK/verify.crt" 2>/dev/null)
+  if ! printf '%s' "$san" | grep -qF "DNS:$domain"; then
+    echo "   FAILED: the certificate does not cover $domain"; cleanup; BAD=$((BAD+1)); continue
+  fi
+  if ! printf '%s' "$san" | grep -qF "DNS:*.$domain"; then
+    echo "   FAILED: the certificate does not cover the *.$domain wildcard"; cleanup; BAD=$((BAD+1)); continue
+  fi
+
+  if ! openssl x509 -noout -checkend 0 -in "$WORK/verify.crt" >/dev/null 2>&1; then
+    echo '   FAILED: the returned certificate is already expired'; cleanup; BAD=$((BAD+1)); continue
+  fi
+
+  echo '   verified: parses, matches the key, covers both names, not expired'
+
+  # Installing a pair is transactional. The previous certificate and key are copied aside
+  # first, because the old failure mode was: overwrite the certificate, fail to move the key,
+  # delete the new certificate - and leave the host with a stale key and no certificate at
+  # all. Any partial failure now restores BOTH previous files.
   crt_out="${OUT_DIR}/${domain}.crt"; key_out="${OUT_DIR}/${domain}.key"
-  crt_tmp="$WORK/out.crt"; key_tmp="$WORK/out.key"
-  if ! (umask 077; printf '%s\n' "$cert" > "$crt_tmp") || ! (umask 077; cat "$key" > "$key_tmp"); then
+  crt_tmp="$WORK/out.crt";   key_tmp="$WORK/out.key"
+  crt_prev="$WORK/prev.crt"; key_prev="$WORK/prev.key"
+  had_prev_crt=0; had_prev_key=0
+  [ -f "$crt_out" ] && { cp -p "$crt_out" "$crt_prev" && had_prev_crt=1; }
+  [ -f "$key_out" ] && { cp -p "$key_out" "$key_prev" && had_prev_key=1; }
+
+  restore_pair(){
+    if [ "$had_prev_crt" = 1 ]; then cp -p "$crt_prev" "$crt_out" 2>/dev/null; else rm -f "$crt_out"; fi
+    if [ "$had_prev_key" = 1 ]; then cp -p "$key_prev" "$key_out" 2>/dev/null; else rm -f "$key_out"; fi
+  }
+
+  if ! (umask 077; printf '%s\n' "$cert" > "$crt_tmp") \
+     || ! (umask 077; cat "$key" > "$key_tmp"); then
     echo '   FAILED: could not stage the certificate or key'; cleanup; BAD=$((BAD+1)); continue
   fi
   chmod 600 "$crt_tmp" "$key_tmp" 2>/dev/null
+
   if ! mv -f "$crt_tmp" "$crt_out"; then
-    echo '   FAILED: could not install the certificate'; cleanup; BAD=$((BAD+1)); continue
+    echo '   FAILED: could not install the certificate; previous pair left untouched'
+    restore_pair; cleanup; BAD=$((BAD+1)); continue
   fi
   if ! mv -f "$key_tmp" "$key_out"; then
-    # The certificate landed but the key did not: remove the half-written pair rather than
-    # leaving a certificate whose key is missing or stale.
-    echo '   FAILED: could not install the key; removing the orphaned certificate'
-    rm -f "$crt_out"
-    cleanup; BAD=$((BAD+1)); continue
+    echo '   FAILED: could not install the key; restoring the previous pair'
+    restore_pair; cleanup; BAD=$((BAD+1)); continue
+  fi
+
+  # Confirm what actually landed on disk still matches, rather than trusting the moves.
+  inst_crt=$(openssl x509 -noout -modulus -in "$crt_out" 2>/dev/null | openssl md5)
+  inst_key=$(openssl rsa -noout -modulus -in "$key_out" 2>/dev/null | openssl md5)
+  if [ -z "$inst_crt" ] || [ "$inst_crt" != "$inst_key" ]; then
+    echo '   FAILED: the installed pair does not match; restoring the previous one'
+    restore_pair; cleanup; BAD=$((BAD+1)); continue
   fi
   cleanup
 
