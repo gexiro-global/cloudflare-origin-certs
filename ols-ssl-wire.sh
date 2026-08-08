@@ -77,14 +77,15 @@ if [ "$APPLY" = "1" ]; then
 fi
 
 WIRED=0; SKIPPED=0; FAILED=0
-# "<backup>:<live file>" pairs, so a failed configuration test can restore every file this run
-# touched - not just the last one.
-BACKUPS=""
+# Parallel arrays of (backup, live file), so a failed test or an interruption can restore every
+# file this run touched - not just the last one. Arrays, not a delimited string: a config path
+# containing a space or a colon must still round-trip correctly.
+BACKUP_B=(); BACKUP_C=()
 
 restore_all(){
-  local pair b c rc=0
-  for pair in $BACKUPS; do
-    b=${pair%%:*}; c=${pair#*:}
+  local i b c rc=0
+  for i in "${!BACKUP_B[@]}"; do
+    b=${BACKUP_B[$i]}; c=${BACKUP_C[$i]}
     if [ -f "$b" ]; then
       cp -p "$b" "$c" || {
         echo "ROLLBACK FAILED for $c - the backup is still at $b" >&2
@@ -134,7 +135,7 @@ for cert in "$CERT_DIR"/*.crt; do
   cp -p "$conf" "$backup" || {
     echo "FAIL $domain - cannot copy the config aside"; FAILED=$((FAILED+1)); continue
   }
-  BACKUPS="$BACKUPS $backup:$conf"
+  BACKUP_B+=("$backup"); BACKUP_C+=("$conf")
 
   # Everything is built here first; $conf itself is untouched until the rename below.
   staged=$(mktemp "${conf}.new.XXXXXX") || { echo "FAIL $domain - cannot create staging file"; FAILED=$((FAILED+1)); continue; }

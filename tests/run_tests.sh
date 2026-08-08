@@ -416,6 +416,22 @@ else
 fi
 rm -rf "$BSIG"
 
+# --- rollback must survive a config path containing a space --------------------------------
+# A delimited-string backup list splits such a path and fails to restore it.
+SP=$(mktemp -d); mkdir -p "$SP/certs" "$SP/vhosts/site a.example" "$SP/bin"
+touch "$SP/certs/site a.example.crt" "$SP/certs/site a.example.key"
+printf 'docRoot /x\n' > "$SP/vhosts/site a.example/vhost.conf"
+cp "$SP/vhosts/site a.example/vhost.conf" "$SP/orig"
+printf '%s\n' '#!/bin/bash' 'exit 1' > "$SP/bin/openlitespeed"     # config test rejects the edit
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$SP/bin/lswsctrl"
+chmod +x "$SP/bin/openlitespeed" "$SP/bin/lswsctrl"
+OLS_BIN="$SP/bin/openlitespeed" LSWSCTRL="$SP/bin/lswsctrl" OLS_WIRE_LOCK_DIR="$SP/lk" \
+  "$ROOT/ols-ssl-wire.sh" --certs "$SP/certs" --vhosts "$SP/vhosts" --apply --restart >/dev/null 2>&1
+diff -q "$SP/orig" "$SP/vhosts/site a.example/vhost.conf" >/dev/null 2>&1 \
+  && ok 'rollback restores a config whose path contains a space' \
+  || no 'rollback restores a config whose path contains a space'
+rm -rf "$SP"
+
 # --- concurrent wiring runs are serialised -------------------------------------------------
 LK=$(mktemp -d); mkdir -p "$LK/certs" "$LK/vhosts"
 CLK=$(mktemp -d)
