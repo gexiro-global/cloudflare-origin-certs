@@ -36,6 +36,18 @@ mkdir -p "$T/realout"; ln -s "$T/realout" "$T/symout"
 "$ROOT/cf-origin-issue.sh" --dry-run --out "$T/symout" example.com >/dev/null 2>&1
 [ $? -eq 2 ] && ok 'refuses a symlinked output directory' || no 'refuses a symlinked output directory'
 
+# A world-writable output dir lets another user read or replace the private keys, even when
+# you own it.
+mkdir -p "$T/wideout"; chmod 0777 "$T/wideout"
+"$ROOT/cf-origin-issue.sh" --dry-run --out "$T/wideout" example.com >/dev/null 2>&1
+[ $? -eq 2 ] && ok 'refuses a world-writable output directory' || no 'refuses a world-writable output directory'
+
+# The issuance lock rejects a symlinked ancestor before contacting the API.
+mkdir -p "$T/lockreal"; ln -s /tmp "$T/lok_link"
+CF_ORIGIN_CA_KEY=x CF_ORIGIN_LOCK_DIR="$T/lok_link/sub" \
+  "$ROOT/cf-origin-issue.sh" --out "$T/lockreal" a.example >/dev/null 2>&1
+[ $? -eq 2 ] && ok 'cf-origin refuses a symlinked lock-path ancestor' || no 'cf-origin refuses a symlinked lock-path ancestor'
+
 echo '== ols-ssl-wire =='
 mkdir -p "$T/certs2" "$T/vhosts/site-a.example" "$T/vhosts/site-b.example"
 touch "$T/certs2/site-a.example.crt" "$T/certs2/site-a.example.key"
@@ -186,6 +198,32 @@ else
   ok 'no work directory is left behind after a signal'
 fi
 rm -rf "$SIG"
+
+# A signal delivered INSIDE the publish critical section (between the two renames) must be
+# ignored, so the cert and key are installed as a consistent pair rather than split. A stub mv
+# signals the script on the FIRST rename, then performs it.
+CSIG=$(mktemp -d); mkdir -p "$CSIG/out" "$CSIG/tmp" "$CSIG/ca" "$CSIG/bin"
+cp "$HERE/fake-origin-ca.sh" "$CSIG/bin/curl"
+cat > "$CSIG/bin/mv" <<STUBEOF
+#!/bin/bash
+n=\$(cat "$CSIG/n" 2>/dev/null || echo 0); n=\$((n+1)); echo \$n > "$CSIG/n"
+[ "\$n" = 1 ] && kill -TERM \$PPID 2>/dev/null
+for real in /bin/mv /usr/bin/mv; do [ -x "\$real" ] && exec "\$real" "\$@"; done
+exit 1
+STUBEOF
+chmod +x "$CSIG/bin/mv"
+env PATH="$CSIG/bin:$PATH" TMPDIR="$CSIG/tmp" FAKE_CA_DIR="$CSIG/ca" FAKE_CA_MODE=good \
+    CF_ORIGIN_CA_KEY=SENTINELsecret123 \
+    "$ROOT/cf-origin-issue.sh" --out "$CSIG/out" a.example >/dev/null 2>&1
+CSIG_RC=$?
+CM=$(openssl x509 -noout -modulus -in "$CSIG/out/a.example.crt" 2>/dev/null | openssl md5)
+KM=$(openssl rsa  -noout -modulus -in "$CSIG/out/a.example.key" 2>/dev/null | openssl md5)
+if [ "$CSIG_RC" -eq 0 ] && [ -n "$CM" ] && [ "$CM" = "$KM" ]; then
+  ok 'a signal during cert/key publish is ignored and the pair is installed consistently'
+else
+  no "a signal during cert/key publish is ignored and the pair is consistent (rc=$CSIG_RC)"
+fi
+rm -rf "$CSIG"
 
 # If the key cannot be installed, the certificate must not be left behind on its own: a
 # certificate whose private key is missing or stale is worse than no certificate at all.
@@ -444,6 +482,14 @@ exec 200<&-; rm -rf "$CLK"
   && ok 'a second wiring run refuses while the first holds the lock' \
   || no "a second wiring run refuses while the first holds the lock (rc=$LK_RC)"
 rm -rf "$LK"
+
+# The wiring lock rejects a symlinked ancestor too.
+OLL=$(mktemp -d); mkdir -p "$OLL/certs" "$OLL/vhosts"; ln -s /tmp "$OLL/link"
+OLS_WIRE_LOCK_DIR="$OLL/link/sub" "$ROOT/ols-ssl-wire.sh" \
+  --certs "$OLL/certs" --vhosts "$OLL/vhosts" --apply >/dev/null 2>&1
+[ $? -eq 2 ] && ok 'ols-ssl-wire refuses a symlinked lock-path ancestor' \
+             || no 'ols-ssl-wire refuses a symlinked lock-path ancestor'
+rm -rf "$OLL"
 
 echo
 echo "passed=$PASS failed=$FAIL"

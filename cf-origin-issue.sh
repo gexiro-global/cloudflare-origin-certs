@@ -112,6 +112,12 @@ MY_UID=$(id -u)
 if [ -L "$OUT_DIR" ] || [ ! -d "$OUT_DIR" ] || [ "$(stat -c %u "$OUT_DIR" 2>/dev/null)" != "$MY_UID" ]; then
   echo "unsafe output directory $OUT_DIR (must be a non-symlink directory you own)" >&2; exit 2
 fi
+# Private keys land here, so the directory must be writable by its owner ONLY: a group- or
+# world-writable output dir lets another user read or replace the keys, even when you own it.
+_om=$(stat -c %a "$OUT_DIR" 2>/dev/null); _om=${_om:-0}
+if [ "$(( (8#$_om) & 18 ))" -ne 0 ]; then
+  echo "unsafe output directory $OUT_DIR (group/world-writable; private keys need an owner-only directory)" >&2; exit 2
+fi
 
 # Two concurrent runs would interleave writes to the same certificate pair. Lock a
 # validated directory under /run/lock, opened READ-ONLY (a directory cannot be truncated),

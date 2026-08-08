@@ -9,8 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (whole ancestor chain validated; group/world-writable non-sticky ancestors refused),
   replacing predictable lock files opened with `>` that a local user could redirect at an
   arbitrary root-writable file (CWE-59). Lock env vars: `CF_ORIGIN_LOCK_DIR`,
-  `OLS_WIRE_LOCK_DIR`. `cf-origin-issue.sh` also refuses a symlinked/foreign-owned `--out`
-  directory (private keys are written there).
+  `OLS_WIRE_LOCK_DIR`. `cf-origin-issue.sh` also refuses a symlinked, foreign-owned, or
+  group/world-writable `--out` directory (private keys need an owner-only directory).
 
 ### Fixed
 - `cf-origin-issue.sh` publishes the certificate/key pair with `INT`/`TERM`/`HUP` blocked
