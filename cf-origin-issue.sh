@@ -41,10 +41,15 @@ cleanup(){
 # A signal handler that only cleans up and returns lets the loop carry on to the next domain,
 # so Ctrl-C would not actually stop issuance. Clean up, then exit with the conventional status.
 on_signal(){ sig="$1"; cleanup; echo "interrupted by SIG${sig}" >&2; trap - EXIT; exit $((128 + $2)); }
+# Publishing the cert/key pair (stage + two renames + match check) must not be splittable
+# by a signal, or an interruption between the two renames would leave the new certificate
+# with the old key. arm/disarm bracket that critical section: INT/TERM/HUP are ignored
+# across it and re-armed immediately after. (SIGKILL/power loss between the two renames is
+# the one residual; the next run re-issues and the post-install match check catches it.)
+arm_signals(){ trap 'on_signal INT 2' INT; trap 'on_signal TERM 15' TERM; trap 'on_signal HUP 1' HUP; }
+disarm_signals(){ trap '' INT TERM HUP; }
 trap cleanup EXIT
-trap 'on_signal INT 2'  INT
-trap 'on_signal TERM 15' TERM
-trap 'on_signal HUP 1'   HUP
+arm_signals
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -101,16 +106,46 @@ if [ "$DRY" = "0" ]; then
 fi
 
 mkdir -p "$OUT_DIR" || { echo "cannot create output directory: $OUT_DIR" >&2; exit 2; }
+# Private keys are written here, so refuse a symlinked or foreign-owned output dir: an
+# attacker who controls it could redirect where keys land, or read them.
+MY_UID=$(id -u)
+if [ -L "$OUT_DIR" ] || [ ! -d "$OUT_DIR" ] || [ "$(stat -c %u "$OUT_DIR" 2>/dev/null)" != "$MY_UID" ]; then
+  echo "unsafe output directory $OUT_DIR (must be a non-symlink directory you own)" >&2; exit 2
+fi
 
-# Two concurrent runs would interleave writes to the same certificate pair. Fail closed: if
-# the lock cannot be taken, stop rather than issue unserialised.
+# Two concurrent runs would interleave writes to the same certificate pair. Lock a
+# validated directory under /run/lock, opened READ-ONLY (a directory cannot be truncated),
+# NOT a lock file inside the output dir: a fixed lock file opened with `>` under an
+# attacker-influenced output dir was a symlink-truncation primitive (CWE-59). Fail closed.
 if [ "$DRY" = "0" ]; then
-  ISSUE_LOCK="${CF_ORIGIN_LOCK:-$OUT_DIR/.issue.lock}"
   command -v flock >/dev/null 2>&1 \
     || { echo "flock is required so two runs cannot write the same pair" >&2; exit 2; }
-  { exec 7>"$ISSUE_LOCK"; } 2>/dev/null \
-    || { echo "cannot open lock file $ISSUE_LOCK" >&2; exit 2; }
-  flock -n 7 || { echo "another issuance run holds $ISSUE_LOCK" >&2; exit 2; }
+  if [ -n "${CF_ORIGIN_LOCK_DIR:-}" ]; then LOCK_DIR="$CF_ORIGIN_LOCK_DIR"
+  elif [ "$MY_UID" = "0" ]; then LOCK_DIR=/run/lock/cf-origin-issue
+  elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then LOCK_DIR="$XDG_RUNTIME_DIR/cf-origin-issue"
+  else LOCK_DIR="${TMPDIR:-/tmp}/cf-origin-issue-$MY_UID"; fi
+  _lp=$(dirname "$LOCK_DIR")
+  while :; do
+    if [ -L "$_lp" ]; then echo "lock path ancestor is a symlink: $_lp" >&2; exit 2; fi
+    if [ -e "$_lp" ]; then
+      _lo=$(stat -c %u "$_lp" 2>/dev/null)
+      if [ "$_lo" != "0" ] && [ "$_lo" != "$MY_UID" ]; then
+        echo "lock path ancestor $_lp is owned by uid $_lo (not root or you)" >&2; exit 2
+      fi
+      _lm=$(stat -c %a "$_lp" 2>/dev/null); _lm=${_lm:-0}
+      if [ "$(( (8#$_lm) & 18 ))" -ne 0 ] && [ "$(( (8#$_lm) & 512 ))" -eq 0 ]; then
+        echo "lock path ancestor $_lp is group/world-writable and not sticky" >&2; exit 2
+      fi
+    fi
+    _lpar=$(dirname "$_lp"); [ "$_lpar" = "$_lp" ] && break; _lp="$_lpar"
+  done
+  mkdir "$LOCK_DIR" 2>/dev/null || true
+  if [ -L "$LOCK_DIR" ] || [ ! -d "$LOCK_DIR" ] || [ "$(stat -c %u "$LOCK_DIR" 2>/dev/null)" != "$MY_UID" ]; then
+    echo "unsafe lock dir $LOCK_DIR (must be a non-symlink directory owned by uid $MY_UID)" >&2; exit 2
+  fi
+  { exec 7<"$LOCK_DIR"; } 2>/dev/null \
+    || { echo "cannot open lock dir $LOCK_DIR" >&2; exit 2; }
+  flock -n 7 || { echo "another issuance run holds the lock" >&2; exit 2; }
 fi
 OK=0; BAD=0
 
@@ -308,31 +343,37 @@ PY
     return $rc
   }
 
+  # --- critical section: publish the pair atomically w.r.t. INT/TERM/HUP --------------
+  # With the signals disarmed, an interruption cannot land between the two renames and
+  # leave a new cert with the old key. Any failure sets install_rc and rolls back; the
+  # handlers are re-armed before the loop continues.
+  disarm_signals
+  install_rc=0
   if ! (umask 077; printf '%s\n' "$cert" > "$crt_tmp") \
      || ! (umask 077; cat "$key" > "$key_tmp"); then
-    echo '   FAILED: could not stage the certificate or key'; cleanup; BAD=$((BAD+1)); continue
+    echo '   FAILED: could not stage the certificate or key'; install_rc=1
   fi
-  chmod 600 "$crt_tmp" "$key_tmp" 2>/dev/null
-
-  if ! mv -f "$crt_tmp" "$crt_out"; then
-    echo '   FAILED: could not install the certificate; previous pair left untouched'
-    restore_pair || KEEP_WORK=1
-    cleanup; BAD=$((BAD+1)); continue
+  if [ "$install_rc" = 0 ]; then
+    chmod 600 "$crt_tmp" "$key_tmp" 2>/dev/null
+    if ! mv -f "$crt_tmp" "$crt_out"; then
+      echo '   FAILED: could not install the certificate; previous pair left untouched'
+      restore_pair || KEEP_WORK=1; install_rc=1
+    elif ! mv -f "$key_tmp" "$key_out"; then
+      echo '   FAILED: could not install the key; restoring the previous pair'
+      restore_pair || KEEP_WORK=1; install_rc=1
+    else
+      # Confirm what actually landed on disk matches, rather than trusting the moves.
+      inst_crt=$(openssl x509 -noout -modulus -in "$crt_out" 2>/dev/null | openssl md5)
+      inst_key=$(openssl rsa -noout -modulus -in "$key_out" 2>/dev/null | openssl md5)
+      if [ -z "$inst_crt" ] || [ "$inst_crt" != "$inst_key" ]; then
+        echo '   FAILED: the installed pair does not match; restoring the previous one'
+        restore_pair || KEEP_WORK=1; install_rc=1
+      fi
+    fi
   fi
-  if ! mv -f "$key_tmp" "$key_out"; then
-    echo '   FAILED: could not install the key; restoring the previous pair'
-    restore_pair || KEEP_WORK=1
-    cleanup; BAD=$((BAD+1)); continue
-  fi
-
-  # Confirm what actually landed on disk still matches, rather than trusting the moves.
-  inst_crt=$(openssl x509 -noout -modulus -in "$crt_out" 2>/dev/null | openssl md5)
-  inst_key=$(openssl rsa -noout -modulus -in "$key_out" 2>/dev/null | openssl md5)
-  if [ -z "$inst_crt" ] || [ "$inst_crt" != "$inst_key" ]; then
-    echo '   FAILED: the installed pair does not match; restoring the previous one'
-    restore_pair || KEEP_WORK=1
-    cleanup; BAD=$((BAD+1)); continue
-  fi
+  arm_signals
+  # --- end critical section -----------------------------------------------------------
+  if [ "$install_rc" != 0 ]; then cleanup; BAD=$((BAD+1)); continue; fi
   cleanup
 
   echo "   issued -> $crt_out"

@@ -12,7 +12,10 @@
 # Usage:
 #   ols-ssl-wire.sh [--certs DIR] [--vhosts DIR] [--apply] [--restart]
 #
-# Exit: 0 ok | 1 something was skipped, the config test failed, or the restart failed | 2 usage error
+# Exit: 0 ok | 1 something was skipped, the config test failed or was skipped, or the
+#            restart failed | 2 usage error
+# Env: OLS_WIRE_LOCK_DIR (lock dir), OLS_ALLOW_UNVALIDATED=1 (accept changes when the
+#      config-test binary is absent and --restart was not requested)
 set -uo pipefail
 
 CERT_DIR="${OLS_CERT_DIR:-/usr/local/lsws/conf/cert/origin-certs}"
@@ -39,12 +42,38 @@ done
 # Two runs rewriting the same vhost tree would interleave their swaps and their backups.
 # Fail closed, consistently with the rest of the toolkit.
 if [ "$APPLY" = "1" ]; then
-  WIRE_LOCK="${OLS_WIRE_LOCK:-/tmp/ols-ssl-wire.lock}"
   command -v flock >/dev/null 2>&1 \
     || { echo "flock is required so two runs cannot rewrite the same vhosts" >&2; exit 2; }
-  { exec 7>"$WIRE_LOCK"; } 2>/dev/null \
-    || { echo "cannot open lock file $WIRE_LOCK" >&2; exit 2; }
-  flock -n 7 || { echo "another wiring run holds $WIRE_LOCK" >&2; exit 2; }
+  # Lock a validated /run/lock directory opened READ-ONLY (a directory cannot be
+  # truncated), not a fixed /tmp lock file opened with `>` that a local user could
+  # redirect at an arbitrary root-writable file via a pre-planted symlink (CWE-59).
+  MY_UID=$(id -u)
+  if [ -n "${OLS_WIRE_LOCK_DIR:-}" ]; then LOCK_DIR="$OLS_WIRE_LOCK_DIR"
+  elif [ "$MY_UID" = "0" ]; then LOCK_DIR=/run/lock/ols-ssl-wire
+  elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then LOCK_DIR="$XDG_RUNTIME_DIR/ols-ssl-wire"
+  else LOCK_DIR="${TMPDIR:-/tmp}/ols-ssl-wire-$MY_UID"; fi
+  _lp=$(dirname "$LOCK_DIR")
+  while :; do
+    if [ -L "$_lp" ]; then echo "lock path ancestor is a symlink: $_lp" >&2; exit 2; fi
+    if [ -e "$_lp" ]; then
+      _lo=$(stat -c %u "$_lp" 2>/dev/null)
+      if [ "$_lo" != "0" ] && [ "$_lo" != "$MY_UID" ]; then
+        echo "lock path ancestor $_lp is owned by uid $_lo (not root or you)" >&2; exit 2
+      fi
+      _lm=$(stat -c %a "$_lp" 2>/dev/null); _lm=${_lm:-0}
+      if [ "$(( (8#$_lm) & 18 ))" -ne 0 ] && [ "$(( (8#$_lm) & 512 ))" -eq 0 ]; then
+        echo "lock path ancestor $_lp is group/world-writable and not sticky" >&2; exit 2
+      fi
+    fi
+    _lpar=$(dirname "$_lp"); [ "$_lpar" = "$_lp" ] && break; _lp="$_lpar"
+  done
+  mkdir "$LOCK_DIR" 2>/dev/null || true
+  if [ -L "$LOCK_DIR" ] || [ ! -d "$LOCK_DIR" ] || [ "$(stat -c %u "$LOCK_DIR" 2>/dev/null)" != "$MY_UID" ]; then
+    echo "unsafe lock dir $LOCK_DIR (must be a non-symlink directory owned by uid $MY_UID)" >&2; exit 2
+  fi
+  { exec 7<"$LOCK_DIR"; } 2>/dev/null \
+    || { echo "cannot open lock dir $LOCK_DIR" >&2; exit 2; }
+  flock -n 7 || { echo "another wiring run holds the lock" >&2; exit 2; }
 fi
 
 WIRED=0; SKIPPED=0; FAILED=0
@@ -66,6 +95,16 @@ restore_all(){
   [ "$rc" = 0 ] || echo 'one or more vhosts could not be rolled back - fix them before reloading' >&2
   return $rc
 }
+
+# An interruption mid-batch must not leave a partially applied vhost set live. Roll every
+# file this run touched back to its backup, then exit. Only meaningful under --apply, where
+# BACKUPS is populated; a dry run changes nothing.
+on_wire_signal(){ echo "interrupted by SIG$1 - rolling back this batch" >&2; restore_all; trap - EXIT; exit $((128 + $2)); }
+if [ "$APPLY" = "1" ]; then
+  trap 'on_wire_signal INT 2'  INT
+  trap 'on_wire_signal TERM 15' TERM
+  trap 'on_wire_signal HUP 1'   HUP
+fi
 
 for cert in "$CERT_DIR"/*.crt; do
   [ -f "$cert" ] || continue
@@ -205,7 +244,7 @@ echo "wired=$WIRED skipped=$SKIPPED failed=$FAILED"
 # Validate the configuration before anything is restarted. A vhost edit that breaks parsing takes
 # every site on the box down the moment the server reloads, so the test runs first and a failure
 # rolls every file this run touched back to its backup.
-CONFIG_BAD=0
+CONFIG_BAD=0; VALIDATE_SKIPPED=0
 if [ "$APPLY" = "1" ] && [ "$WIRED" -gt 0 ]; then
   # A batch that partly failed must not be validated and restarted as if it were complete: the
   # server would come up on a half-applied set of changes. Roll the whole batch back instead.
@@ -234,8 +273,16 @@ if [ "$APPLY" = "1" ] && [ "$WIRED" -gt 0 ]; then
       restore_all
       CONFIG_BAD=1
     else
+      # A skipped validation is not a success: the changes are live but unproven. Report
+      # failure unless the operator explicitly accepts unvalidated changes.
       echo "config test skipped: $OLS_BIN not found or not executable" >&2
-      echo 'the changes are in place but unvalidated - test before you reload' >&2
+      if [ "${OLS_ALLOW_UNVALIDATED:-0}" = "1" ]; then
+        echo 'the changes are in place but unvalidated (OLS_ALLOW_UNVALIDATED=1 accepted)' >&2
+      else
+        echo 'the changes are in place but could not be validated - reporting failure' >&2
+        echo '(set OLS_ALLOW_UNVALIDATED=1 to accept unvalidated changes, or install the test binary)' >&2
+        VALIDATE_SKIPPED=1
+      fi
     fi
   fi
 fi
@@ -254,4 +301,4 @@ elif [ "$APPLY" = "1" ] && [ "$WIRED" -gt 0 ]; then
   echo "config updated. Reload when you are ready:  $LSWSCTRL restart"
 fi
 
-[ "$SKIPPED" -eq 0 ] && [ "$FAILED" -eq 0 ] && [ "$RESTART_FAILED" -eq 0 ] && [ "$CONFIG_BAD" -eq 0 ]
+[ "$SKIPPED" -eq 0 ] && [ "$FAILED" -eq 0 ] && [ "$RESTART_FAILED" -eq 0 ] && [ "$CONFIG_BAD" -eq 0 ] && [ "$VALIDATE_SKIPPED" -eq 0 ]

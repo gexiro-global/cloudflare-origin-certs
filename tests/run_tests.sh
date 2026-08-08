@@ -30,6 +30,12 @@ printf '%s' "$OUT" | grep -q 'issued=2 failed=0' \
 "$ROOT/cf-origin-issue.sh" --dry-run --out "$T/certs" >/dev/null 2>&1
 [ $? -eq 2 ] && ok 'refuses to run with no domains' || no 'refuses to run with no domains'
 
+# Private keys are written to --out, so a symlinked output directory (which could redirect
+# where keys land) is refused.
+mkdir -p "$T/realout"; ln -s "$T/realout" "$T/symout"
+"$ROOT/cf-origin-issue.sh" --dry-run --out "$T/symout" example.com >/dev/null 2>&1
+[ $? -eq 2 ] && ok 'refuses a symlinked output directory' || no 'refuses a symlinked output directory'
+
 echo '== ols-ssl-wire =='
 mkdir -p "$T/certs2" "$T/vhosts/site-a.example" "$T/vhosts/site-b.example"
 touch "$T/certs2/site-a.example.crt" "$T/certs2/site-a.example.key"
@@ -344,14 +350,23 @@ diff -q "$NOV/orig.conf" "$NOV/vhosts/s.example/vhost.conf" >/dev/null \
   && ok 'and rolls the vhost back' || no 'and rolls the vhost back'
 [ -f "$NOV/restarted" ] && no 'and does not restart' || ok 'and does not restart'
 
-# Without --restart the same situation is only a warning: nothing is reloaded, so unvalidated
-# changes on disk are the operator's call.
+# Without --restart a skipped validation is not a success either: the changes are live but
+# unproven, so the run reports failure unless the operator explicitly accepts them.
 cp "$NOV/orig.conf" "$NOV/vhosts/s.example/vhost.conf"
 OUT=$(OLS_BIN="$NOV/bin/absent" "$ROOT/ols-ssl-wire.sh" \
       --certs "$NOV/certs" --vhosts "$NOV/vhosts" --apply 2>&1)
-printf '%s' "$OUT" | grep -q 'test before you reload' \
-  && ok 'without --restart a missing validator is a warning, not a failure' \
-  || no 'without --restart a missing validator is a warning, not a failure'
+RC=$?
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'could not be validated'; then
+  ok 'a skipped validation reports failure even without --restart'
+else
+  no "a skipped validation reports failure even without --restart (rc=$RC)"
+fi
+# ...unless the operator explicitly accepts unvalidated changes.
+cp "$NOV/orig.conf" "$NOV/vhosts/s.example/vhost.conf"
+OLS_BIN="$NOV/bin/absent" OLS_ALLOW_UNVALIDATED=1 "$ROOT/ols-ssl-wire.sh" \
+  --certs "$NOV/certs" --vhosts "$NOV/vhosts" --apply >/dev/null 2>&1
+[ $? -eq 0 ] && ok 'OLS_ALLOW_UNVALIDATED=1 accepts unvalidated changes' \
+             || no 'OLS_ALLOW_UNVALIDATED=1 accepts unvalidated changes'
 rm -rf "$NOV"
 
 # --- an incomplete batch must not be validated and reloaded --------------------------------
@@ -374,16 +389,44 @@ diff -q "$INC/orig.conf" "$INC/vhosts/ok.example/vhost.conf" >/dev/null \
 [ -f "$INC/restarted" ] && no 'and nothing is restarted' || ok 'and nothing is restarted'
 rm -rf "$INC"
 
+# --- a signal mid-batch rolls back every applied vhost -------------------------------------
+# Without a batch signal trap, an interrupted --apply leaves a partially wired (live) set.
+BSIG=$(mktemp -d); mkdir -p "$BSIG/certs" "$BSIG/vhosts/a.example" "$BSIG/vhosts/b.example" "$BSIG/bin"
+touch "$BSIG/certs/a.example.crt" "$BSIG/certs/a.example.key" "$BSIG/certs/b.example.crt" "$BSIG/certs/b.example.key"
+printf 'docRoot /x\n' > "$BSIG/vhosts/a.example/vhost.conf"
+printf 'docRoot /x\n' > "$BSIG/vhosts/b.example/vhost.conf"
+cp "$BSIG/vhosts/a.example/vhost.conf" "$BSIG/a.orig"
+cp "$BSIG/vhosts/b.example/vhost.conf" "$BSIG/b.orig"
+# a stub chown (called per-domain, after staging, before the swap) that terminates the run
+# during the SECOND domain - after the first has already been swapped in.
+cat > "$BSIG/bin/chown" <<STUBEOF
+#!/bin/bash
+n=\$(cat "$BSIG/n" 2>/dev/null || echo 0); n=\$((n+1)); echo \$n > "$BSIG/n"
+[ "\$n" -ge 2 ] && { kill -TERM \$PPID 2>/dev/null; sleep 5; }
+exit 0
+STUBEOF
+chmod +x "$BSIG/bin/chown"
+PATH="$BSIG/bin:$PATH" OLS_WIRE_LOCK_DIR="$BSIG/lk" "$ROOT/ols-ssl-wire.sh" \
+  --certs "$BSIG/certs" --vhosts "$BSIG/vhosts" --apply >/dev/null 2>&1
+if diff -q "$BSIG/a.orig" "$BSIG/vhosts/a.example/vhost.conf" >/dev/null 2>&1 \
+   && diff -q "$BSIG/b.orig" "$BSIG/vhosts/b.example/vhost.conf" >/dev/null 2>&1; then
+  ok 'a signal mid-batch rolls back every applied vhost'
+else
+  no 'a signal mid-batch rolls back every applied vhost'
+fi
+rm -rf "$BSIG"
+
 # --- concurrent wiring runs are serialised -------------------------------------------------
 LK=$(mktemp -d); mkdir -p "$LK/certs" "$LK/vhosts"
-touch "$LK/lock"
-( flock -n 9 || exit 1
-  OLS_WIRE_LOCK="$LK/lock" "$ROOT/ols-ssl-wire.sh" \
-    --certs "$LK/certs" --vhosts "$LK/vhosts" --apply >/dev/null 2>&1
-  echo $? > "$LK/rc" ) 9>"$LK/lock"
-[ "$(cat "$LK/rc" 2>/dev/null)" = 2 ] \
+CLK=$(mktemp -d)
+exec 200<"$CLK"; flock -n 200 || no 'test could not take its own lock'
+OLS_WIRE_LOCK_DIR="$CLK" "$ROOT/ols-ssl-wire.sh" \
+  --certs "$LK/certs" --vhosts "$LK/vhosts" --apply >/dev/null 2>&1
+LK_RC=$?
+exec 200<&-; rm -rf "$CLK"
+[ "$LK_RC" = 2 ] \
   && ok 'a second wiring run refuses while the first holds the lock' \
-  || no 'a second wiring run refuses while the first holds the lock'
+  || no "a second wiring run refuses while the first holds the lock (rc=$LK_RC)"
 rm -rf "$LK"
 
 echo
