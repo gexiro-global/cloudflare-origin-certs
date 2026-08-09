@@ -1,10 +1,10 @@
 # cloudflare-origin-certs
 
 [![CI](https://github.com/gexiro-global/cloudflare-origin-certs/actions/workflows/ci.yml/badge.svg)](https://github.com/gexiro-global/cloudflare-origin-certs/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Issue Cloudflare Origin CA certificates for many domains at once, and wire them into
-OpenLiteSpeed vhosts - without a restart you did not ask for.
+OpenLiteSpeed vhosts — without a restart you did not ask for.
 
 | Script | What it does |
 |---|---|
@@ -118,4 +118,6 @@ own arguments, asserting the key never reaches argv and is never left on disk.
 
 Apache-2.0. See [LICENSE](LICENSE).
 
-Built and maintained by Gexiro Global Enterprises Ltd.
+Built and maintained by [Gexiro Global Enterprises Ltd](https://gexiro.com).
+
+Part of the [Gexiro open-source toolkit](https://github.com/gexiro-global).

@@ -11,7 +11,7 @@ contribution, followed by bug reports with a reproducible vhost layout.
 - Dry run stays the default for anything that writes. A pull request that makes `--apply` implicit
   will be closed.
 - Nothing restarts a web server without an explicit flag.
-- `shellcheck` must pass clean, and the offline suite must stay offline - no test may call the
+- `shellcheck` must pass clean, and the offline suite must stay offline — no test may call the
   Cloudflare API.
 - New behaviour needs an assertion in `tests/run_tests.sh`.
 
