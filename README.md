@@ -1,6 +1,6 @@
 # cloudflare-origin-certs
 
-[![CI](https://github.com/dzeusking-dev/cloudflare-origin-certs/actions/workflows/ci.yml/badge.svg)](https://github.com/dzeusking-dev/cloudflare-origin-certs/actions/workflows/ci.yml)
+[![CI](https://github.com/gexiro-global/cloudflare-origin-certs/actions/workflows/ci.yml/badge.svg)](https://github.com/gexiro-global/cloudflare-origin-certs/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Issue Cloudflare Origin CA certificates for many domains at once, and wire them into
@@ -42,7 +42,7 @@ to discover that your context configuration has changed.
 ## Install
 
 ```bash
-git clone https://github.com/dzeusking-dev/cloudflare-origin-certs.git
+git clone https://github.com/gexiro-global/cloudflare-origin-certs.git
 cd cloudflare-origin-certs
 cp examples/domains.example.txt domains.txt   # then edit it
 ```
