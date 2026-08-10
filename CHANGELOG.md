@@ -4,6 +4,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- No unreleased changes.
+
+## [0.1.1] - 2026-08-10
+
 - Standardize the canonical test runner on an explicit Bash shebang and direct execution.
 
 ## [0.1.0]
