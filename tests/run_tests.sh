@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Offline test suite. No Cloudflare API calls, no OpenLiteSpeed, no root.
 # shellcheck disable=SC2015,SC2016,SC2181,SC2094
 # SC2015: the `[ cond ] && ok "..." || no "..."` shape is intentional here - `ok` cannot fail,
@@ -494,5 +494,4 @@ rm -rf "$OLL"
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
-
 
