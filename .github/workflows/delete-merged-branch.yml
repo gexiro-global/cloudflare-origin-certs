@@ -1,0 +1,43 @@
+name: Delete merged branch
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  delete-branch:
+    # Only merged PRs whose head branch lives in this repository; fork branches are not ours.
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Delete head branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
+            echo "Head branch is the default branch; not deleting."
+            exit 0
+          fi
+          # The name goes into an API path: refuse anything that could change which ref is addressed.
+          case "$BRANCH" in
+            *[!A-Za-z0-9._/-]*)
+              echo "::error::Refusing to delete branch with unexpected characters: $BRANCH"
+              exit 1
+              ;;
+          esac
+          if gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" --silent; then
+            echo "Deleted branch $BRANCH."
+          elif gh api "repos/$REPO/git/ref/heads/$BRANCH" --silent 2>/dev/null; then
+            echo "::error::Branch $BRANCH still exists and could not be deleted."
+            exit 1
+          else
+            echo "Branch $BRANCH was already deleted."
+          fi
